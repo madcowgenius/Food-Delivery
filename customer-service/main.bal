@@ -1,11 +1,14 @@
 import ballerina/http;
 import ballerina/uuid;
 import ballerina/log;
+import ballerina/time;
+import ballerinax/kafka;
 import ballerinax/mongodb;
 
 // MongoDB configuration
 configurable string mongoHost = "mongo";
 configurable int mongoPort = 27017;
+configurable string kafkaBootstrap = "kafka:19092";
 
 final mongodb:Client mongoClient = check new ({
     connection: {
@@ -123,7 +126,6 @@ service /customers on new http:Listener(8082) {
             log:printError("Failed to update customer", updateResult);
             return <http:InternalServerError>{body: {message: "Failed to update customer"}};
         }
-        // Return updated customer
         map<json>|mongodb:Error? updated = customersCol->findOne({"id": id});
         if updated is map<json> {
             return docToCustomerJson(updated);
@@ -148,27 +150,9 @@ service /customers on new http:Listener(8082) {
         return {message: "Customer deleted", id: id};
     }
 
-    // Add order to history
+    // Add order to history (also called by Kafka consumer)
     resource function post [string id]/orders(json orderRef) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = customersCol->findOne({"id": id});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Customer not found", id: id}};
-        }
-        string|error orderId = orderRef.orderId.ensureType();
-        if orderId is error {
-            return <http:InternalServerError>{body: {message: "Invalid order reference"}};
-        }
-        mongodb:UpdateResult|mongodb:Error updateResult = customersCol->updateOne(
-            {"id": id},
-            {"push": {"orderHistory": orderId}}
-        );
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to update order history"}};
-        }
-        return {message: "Order added to history", customerId: id, orderId: orderId};
+        return addOrderToHistory(id, orderRef);
     }
 
     // Get customer order history
@@ -181,6 +165,60 @@ service /customers on new http:Listener(8082) {
             return <http:NotFound>{body: {message: "Customer not found", id: id}};
         }
         return {customerId: id, orderHistory: result["orderHistory"]};
+    }
+}
+
+// Shared helper used by both the HTTP resource and the Kafka consumer
+function addOrderToHistory(string customerId, json orderRef)
+        returns json|http:NotFound|http:InternalServerError {
+    map<json>|mongodb:Error? existing = customersCol->findOne({"id": customerId});
+    if existing is mongodb:Error {
+        return <http:InternalServerError>{body: {message: "Database error"}};
+    }
+    if existing is () {
+        return <http:NotFound>{body: {message: "Customer not found", id: customerId}};
+    }
+    string|error orderId = orderRef.orderId.ensureType();
+    if orderId is error {
+        return <http:InternalServerError>{body: {message: "Invalid order reference"}};
+    }
+    mongodb:UpdateResult|mongodb:Error updateResult = customersCol->updateOne(
+        {"id": customerId},
+        {"push": {"orderHistory": orderId}}
+    );
+    if updateResult is mongodb:Error {
+        return <http:InternalServerError>{body: {message: "Failed to update order history"}};
+    }
+    return {message: "Order added to history", customerId: customerId, orderId: orderId};
+}
+
+// Kafka Consumer: auto-append new orders to the customer's history
+listener kafka:Listener customerEventsListener = new (kafkaBootstrap, {
+    groupId: "customer-service-group",
+    topics: ["orders.created"]
+});
+
+service on customerEventsListener {
+    remote function onConsumerRecord(kafka:BytesConsumerRecord[] records) returns error? {
+        foreach var record in records {
+            string value = check string:fromBytes(record.value);
+            json payload = check value.fromJsonString();
+            string eventType = check payload.eventType.ensureType();
+            if eventType == "ORDER_CREATED" {
+                string orderId = check payload.orderId.ensureType();
+                string customerId = check payload.customerId.ensureType();
+                // Best-effort append; log if it fails
+                json|http:NotFound|http:InternalServerError result =
+                    addOrderToHistory(customerId, {orderId: orderId});
+                if result is http:NotFound {
+                    log:printWarn("Order history skipped: customer " + customerId + " not found");
+                } else if result is http:InternalServerError {
+                    log:printError("Order history update failed for customer " + customerId);
+                } else {
+                    log:printInfo("Order " + orderId + " appended to customer " + customerId);
+                }
+            }
+        }
     }
 }
 
@@ -208,7 +246,7 @@ function docToCustomerJson(map<json> doc) returns json {
     };
 }
 
+// FIXED: was hardcoded to "2026-10-05T00:00:00Z"
 function getCurrentTimestamp() returns string {
-    return "2026-10-05T00:00:00Z";
+    return time:utcToString(time:utcNow());
 }
-
