@@ -1,5 +1,3 @@
-
-
 import ballerina/http;
 import ballerina/uuid;
 import ballerina/log;
