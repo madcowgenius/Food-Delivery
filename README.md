@@ -253,7 +253,7 @@ Food-Delivery/
 
 ## 👥 Group Members
 - Reinhodt T Ndjendja - 221097090
-- Member 2 - Student ID
+- George K Iita -223064971
 - Member 3 - Student ID
 - Member 4 - Student ID
 
