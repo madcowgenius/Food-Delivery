@@ -1,0 +1,56 @@
+{
+  "last_build_time": 1791219352619,
+  "last_update_time": 1791219352619,
+  "last_bal_toml_update_time": 1791218299497,
+  "distribution_version": "2201.13.5",
+  "last_modified_time": {
+    "order_service": 1791218299499
+  },
+  "last_build_options": {
+    "testReport": false,
+    "codeCoverage": false,
+    "skipTests": true,
+    "compilationOptions": {
+      "experimental": false,
+      "observabilityIncluded": true,
+      "cloud": "",
+      "dumpGraph": false,
+      "dumpRawGraphs": false
+    }
+  },
+  "src_meta_info": [
+    {
+      "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\order-service\\Ballerina.toml",
+      "hash": "924c7f8b3025a3ba1c137649e986ad98fddce430aeac871fe85b5a74ab501d8d",
+      "size": 146,
+      "lastModifiedTime": 1791218299497
+    },
+    {
+      "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\order-service\\main.bal",
+      "hash": "57ceed1210acd62d8941a477f02f014fb552a6c63aaafffe922871fe64c2faa8",
+      "size": 87,
+      "lastModifiedTime": 1791218299499
+    }
+  ],
+  "target_exec_meta_info": {
+    "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\order-service\\target\\backup\\bin\\order_service.jar",
+    "hash": "70632b72b32915e0679105b1df9259da5e8ff7782134905887a9cbf27469f668",
+    "size": 11109902,
+    "lastModifiedTime": 1791219355989
+  },
+  "settings_meta_info": {
+    "file": "C:\\Users\\eduna\\.ballerina\\Settings.toml",
+    "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "lastModifiedTime": 1788256860251
+  },
+  "ballerina_toml_meta_info": {
+    "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\order-service\\Ballerina.toml",
+    "hash": "924c7f8b3025a3ba1c137649e986ad98fddce430aeac871fe85b5a74ab501d8d",
+    "size": 146,
+    "lastModifiedTime": 1791218299497
+  },
+  "imports": [
+    "ballerina/io"
+  ]
+}

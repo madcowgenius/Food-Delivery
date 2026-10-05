@@ -1,5 +1,20 @@
-import ballerina/io;
+import ballerina/http;
+import ballerina/time;
 
-public function main() {
-    io:println("Hello, World!");
+type NotificationRequest record {|
+    string recipient;
+    string channel;
+    string message;
+|};
+
+service /notifications on new http:Listener(8086) {
+    resource function post .(NotificationRequest req) returns json {
+        return {
+            status: "SENT",
+            recipient: req.recipient,
+            channel: req.channel,
+            message: req.message,
+            timestamp: time:utcToString(time:utcNow())
+        };
+    }
 }

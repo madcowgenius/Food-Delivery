@@ -1,0 +1,56 @@
+{
+  "last_build_time": 1791219383465,
+  "last_update_time": 1791219383465,
+  "last_bal_toml_update_time": 1791218299499,
+  "distribution_version": "2201.13.5",
+  "last_modified_time": {
+    "payment_service": 1791218299499
+  },
+  "last_build_options": {
+    "testReport": false,
+    "codeCoverage": false,
+    "skipTests": true,
+    "compilationOptions": {
+      "experimental": false,
+      "observabilityIncluded": true,
+      "cloud": "",
+      "dumpGraph": false,
+      "dumpRawGraphs": false
+    }
+  },
+  "src_meta_info": [
+    {
+      "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\payment-service\\Ballerina.toml",
+      "hash": "6807983d905a1768eefc3fe2e3ba793d96783e990932651eea59007497c388e8",
+      "size": 148,
+      "lastModifiedTime": 1791218299499
+    },
+    {
+      "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\payment-service\\main.bal",
+      "hash": "57ceed1210acd62d8941a477f02f014fb552a6c63aaafffe922871fe64c2faa8",
+      "size": 87,
+      "lastModifiedTime": 1791218299499
+    }
+  ],
+  "target_exec_meta_info": {
+    "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\payment-service\\target\\backup\\bin\\payment_service.jar",
+    "hash": "ecba87d6d42d0fae38ab4e6638fa2da33217a4f19dcc04454d116ffac2a81a00",
+    "size": 11110139,
+    "lastModifiedTime": 1791219384635
+  },
+  "settings_meta_info": {
+    "file": "C:\\Users\\eduna\\.ballerina\\Settings.toml",
+    "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "lastModifiedTime": 1788256860251
+  },
+  "ballerina_toml_meta_info": {
+    "file": "C:\\Users\\eduna\\source\\repos\\Food-Delivery\\payment-service\\Ballerina.toml",
+    "hash": "6807983d905a1768eefc3fe2e3ba793d96783e990932651eea59007497c388e8",
+    "size": 148,
+    "lastModifiedTime": 1791218299499
+  },
+  "imports": [
+    "ballerina/io"
+  ]
+}
