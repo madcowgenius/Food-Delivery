@@ -1,242 +1,349 @@
 import ballerina/http;
-import ballerina/uuid;
 import ballerina/log;
+import ballerina/uuid;
 import ballerina/time;
+import ballerina/random;
 import ballerinax/kafka;
 import ballerinax/mongodb;
 
-// MongoDB configuration
-configurable string mongoHost = "mongo";
+// ──────────────────────────────────────────────
+// Configurable Variables
+// ──────────────────────────────────────────────
+configurable int servicePort = 8084;
+configurable string kafkaBootstrapServers = "localhost:9092";
+configurable string mongoHost = "localhost";
 configurable int mongoPort = 27017;
-configurable string kafkaBootstrap = "kafka:19092";
+configurable string databaseName = "payment_db";
 
-final mongodb:Client mongoClient = check new ({
-    connection: {
-        serverAddress: {
-            host: mongoHost,
-            port: mongoPort
-        }
-    }
-});
+// ──────────────────────────────────────────────
+// Record Types
+// ──────────────────────────────────────────────
 
-final mongodb:Database db = check mongoClient->getDatabase("food_delivery");
-final mongodb:Collection paymentsCol = check db->getCollection("payments");
+# Payment method enumeration.
+enum PaymentMethod {
+    CREDIT_CARD,
+    DEBIT_CARD,
+    MOBILE_MONEY,
+    EWALLET,
+    CASH_ON_DELIVERY
+}
 
-final kafka:Producer producer = check new (kafkaBootstrap);
+# Payment status enumeration.
+enum PaymentStatus {
+    PENDING,
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    REFUNDED
+}
 
-// Record types
-type PaymentStatus "PENDING"|"COMPLETED"|"FAILED"|"REFUNDED";
-
-type Payment record {|
-    string id;
-    string orderId;
-    string customerId;
-    decimal amount;
-    string method;
-    PaymentStatus status;
-    string createdAt;
-|};
-
+# Request payload for manual payment processing.
 type PaymentRequest record {|
     string orderId;
     string customerId;
-    decimal amount;
+    float amount;
     string method;
 |};
 
-// HTTP Service
-service /payments on new http:Listener(8084) {
+// ──────────────────────────────────────────────
+// MongoDB and Kafka Initialization
+// ──────────────────────────────────────────────
+final mongodb:Client mongoClient;
+final mongodb:Database db;
+const string PAYMENTS_COLLECTION = "payments";
+final mongodb:Collection paymentsCollection;
 
-    // Process payment
-    resource function post .(PaymentRequest req) returns json|http:InternalServerError {
-        string paymentId = uuid:createType1AsString();
-        string now = time:utcToString(time:utcNow());
+final kafka:Producer kafkaProducer;
 
-        // Simulate payment processing (always succeeds for demo)
-        Payment payment = {
-            id: paymentId,
-            orderId: req.orderId,
-            customerId: req.customerId,
-            amount: req.amount,
-            method: req.method,
-            status: "COMPLETED",
-            createdAt: now
-        };
+const string TOPIC_PAYMENTS_COMPLETED = "payments.completed";
+const string TOPIC_PAYMENTS_FAILED = "payments.failed";
 
-        map<json> doc = {
-            "id": payment.id,
-            "orderId": payment.orderId,
-            "customerId": payment.customerId,
-            "amount": payment.amount,
-            "method": payment.method,
-            "status": payment.status,
-            "createdAt": payment.createdAt
-        };
-
-        mongodb:Error? insertResult = paymentsCol->insertOne(doc);
-        if insertResult is mongodb:Error {
-            log:printError("Failed to insert payment", insertResult);
-            return <http:InternalServerError>{body: {message: "Failed to process payment"}};
+function init() returns error? {
+    mongoClient = check new ({
+        connection: {
+            serverAddress: {
+                host: mongoHost,
+                port: mongoPort
+            }
         }
+    });
+    db = check mongoClient->getDatabase(databaseName);
+    paymentsCollection = check db->getCollection(PAYMENTS_COLLECTION);
+    kafkaProducer = check new (kafkaBootstrapServers);
+}
 
-        // Emit Kafka event: payments.completed
-        json event = {
-            paymentId: paymentId,
-            orderId: req.orderId,
-            customerId: req.customerId,
-            eventType: "PAYMENT_COMPLETED",
-            timestamp: now,
-            amount: req.amount,
-            method: req.method
-        };
-        kafka:Error? sendResult = producer->send({
-            topic: "payments.completed",
-            key: req.orderId.toBytes(),
-            value: event.toJsonString().toBytes()
-        });
-        if sendResult is kafka:Error {
-            log:printError("Failed to send Kafka event", sendResult);
-        }
+// Helper function to query a collection and return array of map<json>
+isolated function queryCollection(mongodb:Collection collectionRef, map<json> filter = {}) returns map<json>[]|error {
+    stream<map<json>, error?> docStream = check collectionRef->find(filter);
+    map<json>[] results = check from var doc in docStream select doc;
+    check docStream.close();
+    return results;
+}
 
-        log:printInfo("Payment processed: " + paymentId + " for order: " + req.orderId);
-        return {paymentId: paymentId, orderId: req.orderId, status: "COMPLETED", amount: req.amount};
+// ──────────────────────────────────────────────
+// Helper: Simulate payment processing
+// Simulates a payment gateway with ~90% success rate.
+// ──────────────────────────────────────────────
+function simulatePayment(float amount, string method) returns boolean|error {
+    log:printInfo("Processing payment", amount = amount, method = method);
+    int randomValue = check random:createIntInRange(1, 100);
+    return randomValue <= 90;
+}
+
+// ──────────────────────────────────────────────
+// Helper: Publish payment event to Kafka
+// ──────────────────────────────────────────────
+function publishPaymentEvent(string topic, json payload) returns error? {
+    byte[] serializedMsg = payload.toJsonString().toBytes();
+    check kafkaProducer->send({
+        topic: topic,
+        value: serializedMsg
+    });
+    log:printInfo("Published payment event", topic = topic);
+}
+
+// ──────────────────────────────────────────────
+// HTTP REST API Service
+// ──────────────────────────────────────────────
+service /api/v1 on new http:Listener(servicePort) {
+
+    # Health check endpoint.
+    resource function get health() returns json {
+        return {"status": "UP", "service": "payment-service"};
     }
 
-    // Get payment by ID
-    resource function get [string paymentId]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = paymentsCol->findOne({"id": paymentId});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Process a payment manually.
+    # + payload - Payment details
+    # + return - Payment result
+    resource function post payments(@http:Payload PaymentRequest payload) returns http:Created|http:InternalServerError {
+        do {
+            string paymentId = uuid:createType1AsString();
+            string transactionId = uuid:createType1AsString();
+            string currentTime = time:utcToString(time:utcNow());
+
+            boolean success = check simulatePayment(payload.amount, payload.method);
+            string status = success ? "COMPLETED" : "FAILED";
+
+            map<json> paymentDoc = {
+                "_id": paymentId,
+                "orderId": payload.orderId,
+                "customerId": payload.customerId,
+                "amount": payload.amount,
+                "method": payload.method,
+                "status": status,
+                "transactionId": transactionId,
+                "createdAt": currentTime,
+                "updatedAt": currentTime
+            };
+
+            check paymentsCollection->insertOne(paymentDoc);
+
+            if success {
+                check publishPaymentEvent(TOPIC_PAYMENTS_COMPLETED, paymentDoc);
+                log:printInfo("Payment completed", paymentId = paymentId, orderId = payload.orderId);
+            } else {
+                check publishPaymentEvent(TOPIC_PAYMENTS_FAILED, paymentDoc);
+                log:printInfo("Payment failed", paymentId = paymentId, orderId = payload.orderId);
+            }
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Payment " + status.toLowerAscii(),
+                    "data": paymentDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to process payment", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if result is () {
-            return <http:NotFound>{body: {message: "Payment not found"}};
-        }
-        return result;
     }
 
-    // Get payment by order ID
-    resource function get 'order/[string orderId]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = paymentsCol->findOne({"orderId": orderId});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Retrieve a payment by ID.
+    # + paymentId - The unique payment identifier
+    # + return - Payment details
+    resource function get payments/[string paymentId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": paymentId};
+            map<json>[] results = check queryCollection(paymentsCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Payment not found"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve payment", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if result is () {
-            return <http:NotFound>{body: {message: "Payment not found for order"}};
-        }
-        return result;
     }
 
-    // Get all payments
-    resource function get .() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = paymentsCol->find({});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch payments"}};
+    # Retrieve payment by order ID.
+    # + orderId - The unique order identifier
+    # + return - Payment details for the order
+    resource function get payments/'order/[string orderId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"orderId": orderId};
+            map<json>[] results = check queryCollection(paymentsCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "No payment found for this order"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve payment by order", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        json[] payments = [];
-        error? e = result.forEach(function(map<json> doc) {
-            payments.push(doc);
-        });
-        if e is error {
-            log:printError("Error iterating payments", e);
-        }
-        return payments;
     }
 
-    // Refund payment
-    resource function put [string paymentId]/refund() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = paymentsCol->findOne({"id": paymentId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Payment not found"}};
-        }
-        string now = time:utcToString(time:utcNow());
-        mongodb:UpdateResult|mongodb:Error updateResult = paymentsCol->updateOne(
-            {"id": paymentId},
-            {"set": {"status": "REFUNDED"}}
-        );
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to refund payment"}};
-        }
+    # Retrieve all payments.
+    # + return - List of all payments
+    resource function get payments() returns json|http:InternalServerError {
+        do {
+            map<json>[] payments = check queryCollection(paymentsCollection, {});
 
-        // Emit refund event
-        json refundEvent = {
-            paymentId: paymentId,
-            orderId: existing["orderId"],
-            eventType: "PAYMENT_REFUNDED",
-            timestamp: now
-        };
-        kafka:Error? sendResult = producer->send({
-            topic: "payments.refunded",
-            key: paymentId.toBytes(),
-            value: refundEvent.toJsonString().toBytes()
-        });
-        if sendResult is kafka:Error {
-            log:printError("Failed to send refund event", sendResult);
+            return {
+                "status": "success",
+                "count": payments.length(),
+                "data": payments
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve payments", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
+    }
 
-        return {paymentId: paymentId, status: "REFUNDED"};
+    # Process a refund for a payment.
+    # + paymentId - The unique payment identifier
+    # + return - Refund result
+    resource function post payments/[string paymentId]/refund() returns json|http:BadRequest|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": paymentId};
+            map<json>[] results = check queryCollection(paymentsCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Payment not found"}
+                };
+                return notFound;
+            }
+
+            string currentPaymentStatus = check results[0]["status"].ensureType();
+            if currentPaymentStatus != "COMPLETED" {
+                http:BadRequest badRequest = {
+                    body: {"status": "error", "message": "Can only refund completed payments"}
+                };
+                return badRequest;
+            }
+
+            string currentTime = time:utcToString(time:utcNow());
+            mongodb:Update update = {
+                set: {
+                    "status": "REFUNDED",
+                    "refundedAt": currentTime,
+                    "updatedAt": currentTime
+                }
+            };
+
+            _ = check paymentsCollection->updateOne(filter, update);
+
+            log:printInfo("Payment refunded", paymentId = paymentId);
+
+            return {
+                "status": "success",
+                "message": "Payment refunded successfully"
+            };
+        } on fail error e {
+            log:printError("Failed to refund payment", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
     }
 }
 
-// Kafka Consumer: Listen for orders.created to auto-process payment
-listener kafka:Listener paymentEventsListener = new (kafkaBootstrap, {
+// ──────────────────────────────────────────────
+// Kafka Consumer: Listen for new order events
+// Automatically processes payment when an order is created
+// ──────────────────────────────────────────────
+listener kafka:Listener paymentKafkaListener = new (kafkaBootstrapServers, {
     groupId: "payment-service-group",
-    topics: ["orders.created"]
+    topics: ["orders.created"],
+    pollingInterval: 1
 });
 
-service on paymentEventsListener {
-    remote function onConsumerRecord(kafka:BytesConsumerRecord[] records) returns error? {
-        foreach var record in records {
-            string value = check string:fromBytes(record.value);
-            json payload = check value.fromJsonString();
-            string eventType = check payload.eventType.ensureType();
+service on paymentKafkaListener {
 
-            if eventType == "ORDER_CREATED" {
-                string orderId = check payload.orderId.ensureType();
-                string customerId = check payload.customerId.ensureType();
-                decimal|error total = payload.total.ensureType();
-                decimal amount = total is error ? 0d : total;
+    # Handles incoming order events to automatically process payment.
+    remote function onConsumerRecord(kafka:BytesConsumerRecord[] records) returns error? {
+        foreach kafka:BytesConsumerRecord rec in records {
+            do {
+                string messageStr = check string:fromBytes(rec.value);
+                json message = check messageStr.fromJsonString();
+
+                log:printInfo("Received order.created event for payment processing");
+
+                string orderId = check message._id.ensureType();
+                string customerId = check message.customerId.ensureType();
+                float totalAmount = check message.totalAmount.ensureType();
 
                 string paymentId = uuid:createType1AsString();
-                string now = time:utcToString(time:utcNow());
+                string transactionId = uuid:createType1AsString();
+                string currentTime = time:utcToString(time:utcNow());
 
-                map<json> doc = {
-                    "id": paymentId,
+                boolean success = check simulatePayment(totalAmount, "CREDIT_CARD");
+                string status = success ? "COMPLETED" : "FAILED";
+
+                map<json> paymentDoc = {
+                    "_id": paymentId,
                     "orderId": orderId,
                     "customerId": customerId,
-                    "amount": amount,
-                    "method": "AUTO",
-                    "status": "COMPLETED",
-                    "createdAt": now
+                    "amount": totalAmount,
+                    "method": "CREDIT_CARD",
+                    "status": status,
+                    "transactionId": transactionId,
+                    "createdAt": currentTime,
+                    "updatedAt": currentTime
                 };
 
-                mongodb:Error? insertResult = paymentsCol->insertOne(doc);
-                if insertResult is mongodb:Error {
-                    log:printError("Failed to auto-process payment", insertResult);
-                    return;
-                }
+                check paymentsCollection->insertOne(paymentDoc);
 
-                // Emit payment completed event
-                json event = {
-                    paymentId: paymentId,
-                    orderId: orderId,
-                    customerId: customerId,
-                    eventType: "PAYMENT_COMPLETED",
-                    timestamp: now,
-                    amount: amount,
-                    method: "AUTO"
-                };
-                kafka:Error? sendResult = producer->send({
-                    topic: "payments.completed",
-                    key: orderId.toBytes(),
-                    value: event.toJsonString().toBytes()
-                });
-                if sendResult is kafka:Error {
-                    log:printError("Failed to emit payment event", sendResult);
+                if success {
+                    check publishPaymentEvent(TOPIC_PAYMENTS_COMPLETED, paymentDoc);
+                    log:printInfo("Auto-payment completed for order", orderId = orderId);
+                } else {
+                    check publishPaymentEvent(TOPIC_PAYMENTS_FAILED, paymentDoc);
+                    log:printInfo("Auto-payment failed for order", orderId = orderId);
                 }
-                log:printInfo("Auto-processed payment for order: " + orderId);
+            } on fail error e {
+                log:printError("Error processing order for payment", 'error = e);
             }
         }
     }

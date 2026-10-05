@@ -1,0 +1,22 @@
+# Ballerina build artifacts
+target/
+.ballerina/
+Dependencies.toml
+*.jar
+
+# Environment & Config overrides
+*.local.toml
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc

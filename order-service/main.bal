@@ -1,411 +1,476 @@
 import ballerina/http;
-import ballerina/uuid;
 import ballerina/log;
+import ballerina/uuid;
 import ballerina/time;
 import ballerinax/kafka;
 import ballerinax/mongodb;
 
-// MongoDB configuration
-configurable string mongoHost = "mongo";
+// ──────────────────────────────────────────────
+// Configurable Variables
+// ──────────────────────────────────────────────
+configurable int servicePort = 8083;
+configurable string kafkaBootstrapServers = "localhost:9092";
+configurable string mongoHost = "localhost";
 configurable int mongoPort = 27017;
-configurable string kafkaBootstrap = "kafka:19092";
+configurable string databaseName = "order_db";
 
-final mongodb:Client mongoClient = check new ({
-    connection: {
-        serverAddress: {
-            host: mongoHost,
-            port: mongoPort
-        }
-    }
-});
+// ──────────────────────────────────────────────
+// Record Types
+// ──────────────────────────────────────────────
 
-final mongodb:Database db = check mongoClient->getDatabase("food_delivery");
-final mongodb:Collection ordersCol = check db->getCollection("orders");
+# Order status enumeration representing the order lifecycle.
+# CREATED → CONFIRMED → PREPARING → READY → OUT_FOR_DELIVERY → DELIVERED (or CANCELLED)
+enum OrderStatus {
+    CREATED,
+    CONFIRMED,
+    PREPARING,
+    READY,
+    OUT_FOR_DELIVERY,
+    DELIVERED,
+    CANCELLED
+}
 
-final kafka:Producer producer = check new (kafkaBootstrap);
-
-// Order status enum
-// CREATED → CONFIRMED → PREPARING → READY → OUT_FOR_DELIVERY → DELIVERED (or CANCELLED)
-type OrderStatus "CREATED"|"CONFIRMED"|"PREPARING"|"READY"|"OUT_FOR_DELIVERY"|"DELIVERED"|"CANCELLED";
-
+# Represents an item in an order.
 type OrderItem record {|
     string menuItemId;
     string name;
     int quantity;
-    decimal price;
+    float price;
 |};
 
-type Order record {|
-    string id;
-    string customerId;
-    string restaurantId;
-    OrderItem[] items;
-    decimal total;
-    OrderStatus status;
-    string? driverId;
-    string? deliveryId;
-    string? paymentId;
-    string createdAt;
-    string updatedAt;
-|};
-
+# Request payload for creating a new order.
 type OrderRequest record {|
     string customerId;
     string restaurantId;
     OrderItem[] items;
-    decimal total;
+    string deliveryAddress;
+    float deliveryLatitude?;
+    float deliveryLongitude?;
 |};
 
-// Valid state transitions
-function isValidTransition(OrderStatus current, OrderStatus next) returns boolean {
-    match current {
-        "CREATED" => {
-            return next == "CONFIRMED" || next == "CANCELLED";
+# Request payload for updating order status.
+type StatusUpdateRequest record {|
+    string status;
+|};
+
+// ──────────────────────────────────────────────
+// MongoDB and Kafka Initialization
+// ──────────────────────────────────────────────
+final mongodb:Client mongoClient;
+final mongodb:Database db;
+const string ORDERS_COLLECTION = "orders";
+final mongodb:Collection ordersCollection;
+
+final kafka:Producer kafkaProducer;
+
+// ──────────────────────────────────────────────
+// Kafka Topic Constants
+// ──────────────────────────────────────────────
+const string TOPIC_ORDERS_CREATED = "orders.created";
+const string TOPIC_ORDERS_CONFIRMED = "orders.confirmed";
+const string TOPIC_ORDERS_PREPARING = "orders.preparing";
+const string TOPIC_ORDERS_READY = "orders.ready";
+const string TOPIC_ORDERS_CANCELLED = "orders.cancelled";
+
+function init() returns error? {
+    mongoClient = check new ({
+        connection: {
+            serverAddress: {
+                host: mongoHost,
+                port: mongoPort
+            }
         }
-        "CONFIRMED" => {
-            return next == "PREPARING" || next == "CANCELLED";
+    });
+    db = check mongoClient->getDatabase(databaseName);
+    ordersCollection = check db->getCollection(ORDERS_COLLECTION);
+    kafkaProducer = check new (kafkaBootstrapServers);
+}
+
+// Helper function to query a collection and return array of map<json>
+isolated function queryCollection(mongodb:Collection collectionRef, map<json> filter = {}) returns map<json>[]|error {
+    stream<map<json>, error?> docStream = check collectionRef->find(filter);
+    map<json>[] results = check from var doc in docStream select doc;
+    check docStream.close();
+    return results;
+}
+
+// ──────────────────────────────────────────────
+// Helper: Calculate total amount from order items
+// ──────────────────────────────────────────────
+function calculateTotal(OrderItem[] items) returns float {
+    float total = 0.0;
+    foreach OrderItem item in items {
+        total += item.price * <float>item.quantity;
+    }
+    return total;
+}
+
+// ──────────────────────────────────────────────
+// Helper: Validate order status transitions
+// ──────────────────────────────────────────────
+function isValidTransition(string currentStatus, string newStatus) returns boolean {
+    if currentStatus == "CREATED" && (newStatus == "CONFIRMED" || newStatus == "CANCELLED") {
+        return true;
+    } else if currentStatus == "CONFIRMED" && (newStatus == "PREPARING" || newStatus == "CANCELLED") {
+        return true;
+    } else if currentStatus == "PREPARING" && (newStatus == "READY" || newStatus == "CANCELLED") {
+        return true;
+    } else if currentStatus == "READY" && (newStatus == "OUT_FOR_DELIVERY" || newStatus == "CANCELLED") {
+        return true;
+    } else if currentStatus == "OUT_FOR_DELIVERY" && newStatus == "DELIVERED" {
+        return true;
+    }
+    return false;
+}
+
+// ──────────────────────────────────────────────
+// Helper: Publish event to Kafka topic
+// ──────────────────────────────────────────────
+function publishOrderEvent(string topic, json payload) returns error? {
+    byte[] serializedMsg = payload.toJsonString().toBytes();
+    check kafkaProducer->send({
+        topic: topic,
+        value: serializedMsg
+    });
+    log:printInfo("Published event", topic = topic);
+}
+
+// ──────────────────────────────────────────────
+// HTTP REST API Service
+// ──────────────────────────────────────────────
+service /api/v1 on new http:Listener(servicePort) {
+
+    # Health check endpoint.
+    resource function get health() returns json {
+        return {"status": "UP", "service": "order-service"};
+    }
+
+    # Create a new order.
+    # Publishes an `orders.created` event to Kafka.
+    # + payload - Order details including items and delivery address
+    # + return - Created order or error
+    resource function post orders(@http:Payload OrderRequest payload) returns http:Created|http:BadRequest|http:InternalServerError {
+        do {
+            if payload.items.length() == 0 {
+                http:BadRequest badRequest = {
+                    body: {"status": "error", "message": "Order must contain at least one item"}
+                };
+                return badRequest;
+            }
+
+            string orderId = uuid:createType1AsString();
+            string currentTime = time:utcToString(time:utcNow());
+            float totalAmount = calculateTotal(payload.items);
+
+            json[] itemsJson = [];
+            foreach OrderItem item in payload.items {
+                itemsJson.push({
+                    "menuItemId": item.menuItemId,
+                    "name": item.name,
+                    "quantity": item.quantity,
+                    "price": item.price
+                });
+            }
+
+            map<json> orderDoc = {
+                "_id": orderId,
+                "customerId": payload.customerId,
+                "restaurantId": payload.restaurantId,
+                "items": itemsJson,
+                "status": "CREATED",
+                "totalAmount": totalAmount,
+                "deliveryAddress": payload.deliveryAddress,
+                "driverId": (),
+                "createdAt": currentTime,
+                "updatedAt": currentTime
+            };
+
+            if payload.deliveryLatitude is float {
+                orderDoc["deliveryLatitude"] = <float>payload.deliveryLatitude;
+            }
+            if payload.deliveryLongitude is float {
+                orderDoc["deliveryLongitude"] = <float>payload.deliveryLongitude;
+            }
+
+            check ordersCollection->insertOne(orderDoc);
+            check publishOrderEvent(TOPIC_ORDERS_CREATED, orderDoc);
+
+            log:printInfo("Order created", orderId = orderId, customerId = payload.customerId);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Order placed successfully",
+                    "data": orderDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to create order", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        "PREPARING" => {
-            return next == "READY" || next == "CANCELLED";
+    }
+
+    # Retrieve all orders with optional filtering.
+    # + status - Optional status filter
+    # + return - List of orders
+    resource function get orders(string? status) returns json|http:InternalServerError {
+        do {
+            map<json> filter = {};
+            if status is string {
+                filter["status"] = status;
+            }
+
+            map<json>[] orders = check queryCollection(ordersCollection, filter);
+
+            return {
+                "status": "success",
+                "count": orders.length(),
+                "data": orders
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve orders", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        "READY" => {
-            return next == "OUT_FOR_DELIVERY" || next == "CANCELLED";
+    }
+
+    # Retrieve a single order by ID.
+    # + orderId - The unique order identifier
+    # + return - Order details or not found
+    resource function get orders/[string orderId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": orderId};
+            map<json>[] results = check queryCollection(ordersCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Order not found"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve order", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        "OUT_FOR_DELIVERY" => {
-            return next == "DELIVERED";
+    }
+
+    # Update the status of an order (manual trigger from restaurant/admin).
+    # Validates state machine transitions and publishes corresponding Kafka events.
+    # + orderId - The unique order identifier
+    # + payload - New status
+    # + return - Updated order or error
+    resource function put orders/[string orderId]/status(@http:Payload StatusUpdateRequest payload) returns json|http:BadRequest|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": orderId};
+            map<json>[] results = check queryCollection(ordersCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Order not found"}
+                };
+                return notFound;
+            }
+
+            string currentStatus = check results[0]["status"].ensureType();
+            string newStatus = payload.status;
+
+            if !isValidTransition(currentStatus, newStatus) {
+                http:BadRequest badRequest = {
+                    body: {
+                        "status": "error",
+                        "message": "Invalid status transition from " + currentStatus + " to " + newStatus
+                    }
+                };
+                return badRequest;
+            }
+
+            string currentTime = time:utcToString(time:utcNow());
+            map<json> updateFields = {
+                "status": newStatus,
+                "updatedAt": currentTime
+            };
+
+            mongodb:Update update = {set: updateFields};
+            _ = check ordersCollection->updateOne(filter, update);
+
+            map<json>[] updatedResults = check queryCollection(ordersCollection, filter);
+            json updatedOrder = updatedResults[0];
+
+            if newStatus == "CONFIRMED" {
+                check publishOrderEvent(TOPIC_ORDERS_CONFIRMED, updatedOrder);
+            } else if newStatus == "PREPARING" {
+                check publishOrderEvent(TOPIC_ORDERS_PREPARING, updatedOrder);
+            } else if newStatus == "READY" {
+                check publishOrderEvent(TOPIC_ORDERS_READY, updatedOrder);
+            } else if newStatus == "CANCELLED" {
+                check publishOrderEvent(TOPIC_ORDERS_CANCELLED, updatedOrder);
+            }
+
+            log:printInfo("Order status updated", orderId = orderId, previousStatus = currentStatus, newStatus = newStatus);
+
+            return {
+                "status": "success",
+                "message": "Order status updated to " + newStatus,
+                "data": updatedOrder
+            };
+        } on fail error e {
+            log:printError("Failed to update order status", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        _ => {
-            return false;
+    }
+
+    # Retrieve all orders for a specific customer.
+    # + customerId - The unique customer identifier
+    # + return - List of customer orders
+    resource function get orders/customer/[string customerId]() returns json|http:InternalServerError {
+        do {
+            map<json> filter = {"customerId": customerId};
+            map<json>[] orders = check queryCollection(ordersCollection, filter);
+
+            return {
+                "status": "success",
+                "count": orders.length(),
+                "data": orders
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve customer orders", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Retrieve all orders for a specific restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + return - List of restaurant orders
+    resource function get orders/restaurant/[string restaurantId]() returns json|http:InternalServerError {
+        do {
+            map<json> filter = {"restaurantId": restaurantId};
+            map<json>[] orders = check queryCollection(ordersCollection, filter);
+
+            return {
+                "status": "success",
+                "count": orders.length(),
+                "data": orders
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve restaurant orders", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
     }
 }
 
-// HTTP Service
-service /orders on new http:Listener(8081) {
-
-    // Create a new order
-    resource function post .(OrderRequest req) returns json|http:InternalServerError {
-        string orderId = uuid:createType1AsString();
-        string now = time:utcToString(time:utcNow());
-        Order 'order = {
-            id: orderId,
-            customerId: req.customerId,
-            restaurantId: req.restaurantId,
-            items: req.items,
-            total: req.total,
-            status: "CREATED",
-            driverId: (),
-            deliveryId: (),
-            paymentId: (),
-            createdAt: now,
-            updatedAt: now
-        };
-
-        map<json> doc = orderToDoc('order);
-        mongodb:Error? insertResult = ordersCol->insertOne(doc);
-        if insertResult is mongodb:Error {
-            log:printError("Failed to insert order", insertResult);
-            return <http:InternalServerError>{body: {message: "Failed to create order"}};
-        }
-
-        // Emit Kafka event: orders.created
-        json event = {
-            orderId: orderId,
-            eventType: "ORDER_CREATED",
-            timestamp: now,
-            customerId: req.customerId,
-            restaurantId: req.restaurantId,
-            items: req.items.toJson(),
-            total: req.total
-        };
-        kafka:Error? sendResult = producer->send({
-            topic: "orders.created",
-            key: orderId.toBytes(),
-            value: event.toJsonString().toBytes()
-        });
-        if sendResult is kafka:Error {
-            log:printError("Failed to send Kafka event", sendResult);
-        }
-
-        log:printInfo("Order created: " + orderId);
-        return {orderId: orderId, status: "CREATED"};
-    }
-
-    // Get order by ID
-    resource function get [string orderId]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = ordersCol->findOne({"id": orderId});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if result is () {
-            return <http:NotFound>{body: {message: "Order not found", orderId: orderId}};
-        }
-        return result;
-    }
-
-    // Get all orders
-    resource function get .() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = ordersCol->find({});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch orders"}};
-        }
-        json[] orders = [];
-        error? e = result.forEach(function(map<json> doc) {
-            orders.push(doc);
-        });
-        if e is error {
-            log:printError("Error iterating orders", e);
-        }
-        return orders;
-    }
-
-    // Get orders by customer
-    resource function get customer/[string customerId]() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = ordersCol->find({"customerId": customerId});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch orders"}};
-        }
-        json[] orders = [];
-        error? e = result.forEach(function(map<json> doc) {
-            orders.push(doc);
-        });
-        if e is error {
-            log:printError("Error iterating orders", e);
-        }
-        return orders;
-    }
-
-    // Update order status (state machine transition)
-    resource function put [string orderId]/status(json statusReq) returns json|http:NotFound|http:BadRequest|http:InternalServerError {
-        map<json>|mongodb:Error? existing = ordersCol->findOne({"id": orderId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Order not found"}};
-        }
-
-        string|error currentStatusStr = existing["status"].ensureType();
-        string|error nextStatusStr = statusReq.status.ensureType();
-        if currentStatusStr is error || nextStatusStr is error {
-            return <http:BadRequest>{body: {message: "Invalid status"}};
-        }
-
-        OrderStatus|error currentStatus = currentStatusStr.ensureType();
-        OrderStatus|error nextStatus = nextStatusStr.ensureType();
-        if currentStatus is error || nextStatus is error {
-            return <http:BadRequest>{body: {message: "Invalid status value"}};
-        }
-
-        if !isValidTransition(currentStatus, nextStatus) {
-            return <http:BadRequest>{body: {
-                message: "Invalid state transition",
-                currentStatus: currentStatus,
-                requestedStatus: nextStatus
-            }};
-        }
-
-        string now = time:utcToString(time:utcNow());
-        mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
-            {"id": orderId},
-            {"set": {"status": nextStatus, "updatedAt": now}}
-        );
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to update status"}};
-        }
-
-        // Emit status change event
-        json statusEvent = {
-            orderId: orderId,
-            eventType: "ORDER_STATUS_CHANGED",
-            previousStatus: currentStatus,
-            newStatus: nextStatus,
-            timestamp: now
-        };
-        kafka:Error? sendResult = producer->send({
-            topic: "orders.status",
-            key: orderId.toBytes(),
-            value: statusEvent.toJsonString().toBytes()
-        });
-        if sendResult is kafka:Error {
-            log:printError("Failed to send status event", sendResult);
-        }
-
-        return {orderId: orderId, previousStatus: currentStatus, status: nextStatus};
-    }
-
-    // Cancel order
-    resource function put [string orderId]/cancel() returns json|http:NotFound|http:BadRequest|http:InternalServerError {
-        map<json>|mongodb:Error? existing = ordersCol->findOne({"id": orderId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Order not found"}};
-        }
-
-        string|error currentStatusStr = existing["status"].ensureType();
-        if currentStatusStr is error {
-            return <http:BadRequest>{body: {message: "Invalid current status"}};
-        }
-
-        OrderStatus|error currentStatus = currentStatusStr.ensureType();
-        if currentStatus is error {
-            return <http:BadRequest>{body: {message: "Invalid status value"}};
-        }
-
-        if !isValidTransition(currentStatus, "CANCELLED") {
-            return <http:BadRequest>{body: {
-                message: "Order cannot be cancelled in current state",
-                currentStatus: currentStatus
-            }};
-        }
-
-        string now = time:utcToString(time:utcNow());
-        mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
-            {"id": orderId},
-            {"set": {"status": "CANCELLED", "updatedAt": now}}
-        );
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to cancel order"}};
-        }
-
-        json cancelEvent = {
-            orderId: orderId,
-            eventType: "ORDER_CANCELLED",
-            timestamp: now
-        };
-        kafka:Error? sendResult = producer->send({
-            topic: "orders.status",
-            key: orderId.toBytes(),
-            value: cancelEvent.toJsonString().toBytes()
-        });
-        if sendResult is kafka:Error {
-            log:printError("Failed to send cancel event", sendResult);
-        }
-
-        return {orderId: orderId, status: "CANCELLED"};
-    }
-}
-
-// Kafka Consumer: Listen for payment and delivery events to auto-update order status
-// All transitions are validated against the state machine before persisting.
-listener kafka:Listener orderEventsListener = new (kafkaBootstrap, {
+// ──────────────────────────────────────────────
+// Kafka Consumer: Listen for Payment & Delivery events
+// Automatically updates order status based on events
+// ──────────────────────────────────────────────
+listener kafka:Listener orderKafkaListener = new (kafkaBootstrapServers, {
     groupId: "order-service-group",
-    topics: ["payments.completed", "delivery.assigned", "delivery.completed"]
+    topics: ["payments.completed", "payments.failed", "delivery.assigned", "delivery.completed"],
+    pollingInterval: 1
 });
 
-service on orderEventsListener {
+service on orderKafkaListener {
+
+    # Handles incoming Kafka events for order lifecycle management.
+    # - payments.completed  → Updates order to CONFIRMED
+    # - payments.failed     → Updates order to CANCELLED
+    # - delivery.assigned   → Updates order to OUT_FOR_DELIVERY
+    # - delivery.completed  → Updates order to DELIVERED
     remote function onConsumerRecord(kafka:BytesConsumerRecord[] records) returns error? {
-        foreach var record in records {
-            string value = check string:fromBytes(record.value);
-            json payload = check value.fromJsonString();
-            string eventType = check payload.eventType.ensureType();
-            string orderId = check payload.orderId.ensureType();
-            string now = time:utcToString(time:utcNow());
+        foreach kafka:BytesConsumerRecord rec in records {
+            do {
+                string messageStr = check string:fromBytes(rec.value);
+                json message = check messageStr.fromJsonString();
+                string topic = rec.offset.partition.topic;
 
-            // Fetch current order state
-            map<json>|mongodb:Error? existingOrder = ordersCol->findOne({"id": orderId});
-            if existingOrder is mongodb:Error {
-                log:printError("Failed to fetch order " + orderId, existingOrder);
-                continue;
-            }
-            if existingOrder is () {
-                log:printWarn("Received event for unknown order: " + orderId);
-                continue;
-            }
+                log:printInfo("Received Kafka event", topic = topic);
 
-            string|error curStatusStr = existingOrder["status"].ensureType();
-            if curStatusStr is error {
-                log:printError("Order " + orderId + " has invalid status field");
-                continue;
-            }
-            OrderStatus|error currentStatus = curStatusStr.ensureType();
-            if currentStatus is error {
-                log:printError("Order " + orderId + " has unknown status: " + curStatusStr);
-                continue;
-            }
+                string orderId = check message.orderId.ensureType();
+                string currentTime = time:utcToString(time:utcNow());
 
-            match eventType {
-                "PAYMENT_COMPLETED" => {
-                    // Move order CREATED -> CONFIRMED (validated)
-                    if !isValidTransition(currentStatus, "CONFIRMED") {
-                        log:printWarn("Rejected transition " + currentStatus + " -> CONFIRMED for order " + orderId);
-                        continue;
+                if topic == "payments.completed" {
+                    map<json> filter = {"_id": orderId};
+                    map<json> updateFields = {
+                        "status": "CONFIRMED",
+                        "updatedAt": currentTime
+                    };
+                    mongodb:Update update = {set: updateFields};
+                    _ = check ordersCollection->updateOne(filter, update);
+
+                    map<json>[] results = check queryCollection(ordersCollection, filter);
+                    if results.length() > 0 {
+                        check publishOrderEvent(TOPIC_ORDERS_CONFIRMED, results[0]);
                     }
-                    string|error paymentId = payload.paymentId.ensureType();
-                    map<json> updateFields = {"status": "CONFIRMED", "updatedAt": now};
-                    if paymentId is string {
-                        updateFields["paymentId"] = paymentId;
+
+                    log:printInfo("Order confirmed after payment", orderId = orderId);
+
+                } else if topic == "payments.failed" {
+                    map<json> filter = {"_id": orderId};
+                    map<json> updateFields = {
+                        "status": "CANCELLED",
+                        "cancelReason": "Payment failed",
+                        "updatedAt": currentTime
+                    };
+                    mongodb:Update update = {set: updateFields};
+                    _ = check ordersCollection->updateOne(filter, update);
+
+                    map<json>[] results = check queryCollection(ordersCollection, filter);
+                    if results.length() > 0 {
+                        check publishOrderEvent(TOPIC_ORDERS_CANCELLED, results[0]);
                     }
-                    mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
-                        {"id": orderId},
-                        {"set": updateFields}
-                    );
-                    if updateResult is mongodb:Error {
-                        log:printError("Failed to update order for payment", updateResult);
-                    } else {
-                        log:printInfo("Order confirmed after payment: " + orderId);
-                    }
+
+                    log:printInfo("Order cancelled due to payment failure", orderId = orderId);
+
+                } else if topic == "delivery.assigned" {
+                    string driverId = check message.driverId.ensureType();
+                    map<json> filter = {"_id": orderId};
+                    map<json> updateFields = {
+                        "status": "OUT_FOR_DELIVERY",
+                        "driverId": driverId,
+                        "updatedAt": currentTime
+                    };
+                    mongodb:Update update = {set: updateFields};
+                    _ = check ordersCollection->updateOne(filter, update);
+
+                    log:printInfo("Order out for delivery", orderId = orderId, driverId = driverId);
+
+                } else if topic == "delivery.completed" {
+                    map<json> filter = {"_id": orderId};
+                    map<json> updateFields = {
+                        "status": "DELIVERED",
+                        "deliveredAt": currentTime,
+                        "updatedAt": currentTime
+                    };
+                    mongodb:Update update = {set: updateFields};
+                    _ = check ordersCollection->updateOne(filter, update);
+
+                    log:printInfo("Order delivered successfully", orderId = orderId);
                 }
-                "DELIVERY_ASSIGNED" => {
-                    // Move order READY -> OUT_FOR_DELIVERY (validated)
-                    if !isValidTransition(currentStatus, "OUT_FOR_DELIVERY") {
-                        log:printWarn("Rejected transition " + currentStatus + " -> OUT_FOR_DELIVERY for order " + orderId);
-                        continue;
-                    }
-                    string|error deliveryId = payload.deliveryId.ensureType();
-                    string|error driverId = payload.driverId.ensureType();
-                    map<json> updateFields = {"status": "OUT_FOR_DELIVERY", "updatedAt": now};
-                    if deliveryId is string {
-                        updateFields["deliveryId"] = deliveryId;
-                    }
-                    if driverId is string {
-                        updateFields["driverId"] = driverId;
-                    }
-                    mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
-                        {"id": orderId},
-                        {"set": updateFields}
-                    );
-                    if updateResult is mongodb:Error {
-                        log:printError("Failed to update order for delivery", updateResult);
-                    } else {
-                        log:printInfo("Order out for delivery: " + orderId);
-                    }
-                }
-                "DELIVERY_COMPLETED" => {
-                    // Move order OUT_FOR_DELIVERY -> DELIVERED (validated)
-                    if !isValidTransition(currentStatus, "DELIVERED") {
-                        log:printWarn("Rejected transition " + currentStatus + " -> DELIVERED for order " + orderId);
-                        continue;
-                    }
-                    mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
-                        {"id": orderId},
-                        {"set": {"status": "DELIVERED", "updatedAt": now}}
-                    );
-                    if updateResult is mongodb:Error {
-                        log:printError("Failed to mark order as delivered", updateResult);
-                    } else {
-                        log:printInfo("Order delivered: " + orderId);
-                    }
-                }
+            } on fail error e {
+                log:printError("Error processing Kafka event", 'error = e);
             }
         }
     }
-}
-
-function orderToDoc(Order o) returns map<json> {
-    return {
-        "id": o.id,
-        "customerId": o.customerId,
-        "restaurantId": o.restaurantId,
-        "items": o.items.toJson(),
-        "total": o.total,
-        "status": o.status,
-        "driverId": o.driverId is () ? null : o.driverId,
-        "deliveryId": o.deliveryId is () ? null : o.deliveryId,
-        "paymentId": o.paymentId is () ? null : o.paymentId,
-        "createdAt": o.createdAt,
-        "updatedAt": o.updatedAt
-    };
 }

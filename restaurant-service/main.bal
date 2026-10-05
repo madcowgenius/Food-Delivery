@@ -1,285 +1,511 @@
 import ballerina/http;
-import ballerina/uuid;
 import ballerina/log;
+import ballerina/uuid;
+import ballerina/time;
 import ballerinax/mongodb;
 
-// MongoDB configuration
-configurable string mongoHost = "mongo";
+// ──────────────────────────────────────────────
+// Configurable Variables
+// ──────────────────────────────────────────────
+configurable int servicePort = 8082;
+configurable string mongoHost = "localhost";
 configurable int mongoPort = 27017;
+configurable string databaseName = "restaurant_db";
 
-final mongodb:Client mongoClient = check new ({
-    connection: {
-        serverAddress: {
-            host: mongoHost,
-            port: mongoPort
-        }
-    }
-});
+// ──────────────────────────────────────────────
+// Record Types
+// ──────────────────────────────────────────────
 
-final mongodb:Database db = check mongoClient->getDatabase("food_delivery");
-final mongodb:Collection restaurantsCol = check db->getCollection("restaurants");
-final mongodb:Collection menuItemsCol = check db->getCollection("menu_items");
-
-// Record types
+# Represents a restaurant in the system.
 type Restaurant record {|
-    string id;
+    string _id;
     string name;
     string address;
     string phone;
-    string openingHours;
-    string closingHours;
+    string cuisine;
+    float rating;
     boolean isOpen;
     string createdAt;
+    string updatedAt;
 |};
 
+# Request payload for registering a new restaurant.
 type RestaurantRequest record {|
     string name;
     string address;
     string phone;
-    string openingHours;
-    string closingHours;
+    string cuisine;
 |};
 
+# Represents a menu item belonging to a restaurant.
 type MenuItem record {|
-    string id;
+    string _id;
     string restaurantId;
     string name;
     string description;
-    decimal price;
-    int stock;
+    float price;
     string category;
     boolean available;
+    string imageUrl?;
 |};
 
+# Request payload for adding a menu item.
 type MenuItemRequest record {|
-    string restaurantId;
     string name;
     string description;
-    decimal price;
-    int stock;
+    float price;
     string category;
+    string imageUrl?;
 |};
 
-service /restaurants on new http:Listener(8083) {
+# Opening hours for a restaurant.
+type OpeningHours record {|
+    string _id;
+    string restaurantId;
+    string day;
+    string openTime;
+    string closeTime;
+|};
 
-    // Create a new restaurant
-    resource function post .(RestaurantRequest req) returns json|http:InternalServerError {
-        string id = uuid:createType1AsString();
-        Restaurant restaurant = {
-            id: id,
-            name: req.name,
-            address: req.address,
-            phone: req.phone,
-            openingHours: req.openingHours,
-            closingHours: req.closingHours,
-            isOpen: true,
-            createdAt: "2026-10-05T00:00:00Z"
-        };
-        map<json> doc = {
-            "id": restaurant.id,
-            "name": restaurant.name,
-            "address": restaurant.address,
-            "phone": restaurant.phone,
-            "openingHours": restaurant.openingHours,
-            "closingHours": restaurant.closingHours,
-            "isOpen": restaurant.isOpen,
-            "createdAt": restaurant.createdAt
-        };
-        mongodb:Error? insertResult = restaurantsCol->insertOne(doc);
-        if insertResult is mongodb:Error {
-            log:printError("Failed to insert restaurant", insertResult);
-            return <http:InternalServerError>{body: {message: "Failed to create restaurant"}};
+# Request payload for setting opening hours.
+type OpeningHoursRequest record {|
+    string day;
+    string openTime;
+    string closeTime;
+|};
+
+// ──────────────────────────────────────────────
+// MongoDB Initialization
+// ──────────────────────────────────────────────
+final mongodb:Client mongoClient;
+final mongodb:Database db;
+
+const string RESTAURANTS_COLLECTION = "restaurants";
+const string MENU_ITEMS_COLLECTION = "menu_items";
+const string OPENING_HOURS_COLLECTION = "opening_hours";
+
+final mongodb:Collection restaurantsCollection;
+final mongodb:Collection menuItemsCollection;
+final mongodb:Collection openingHoursCollection;
+
+function init() returns error? {
+    mongoClient = check new ({
+        connection: {
+            serverAddress: {
+                host: mongoHost,
+                port: mongoPort
+            }
         }
-        log:printInfo("Restaurant created: " + id);
-        return restaurant;
+    });
+    db = check mongoClient->getDatabase(databaseName);
+    restaurantsCollection = check db->getCollection(RESTAURANTS_COLLECTION);
+    menuItemsCollection = check db->getCollection(MENU_ITEMS_COLLECTION);
+    openingHoursCollection = check db->getCollection(OPENING_HOURS_COLLECTION);
+}
+
+// Helper function to query a collection and return array of map<json>
+isolated function queryCollection(mongodb:Collection collectionRef, map<json> filter = {}) returns map<json>[]|error {
+    stream<map<json>, error?> docStream = check collectionRef->find(filter);
+    map<json>[] results = check from var doc in docStream select doc;
+    check docStream.close();
+    return results;
+}
+
+// ──────────────────────────────────────────────
+// HTTP REST API Service
+// ──────────────────────────────────────────────
+service /api/v1 on new http:Listener(servicePort) {
+
+    # Health check endpoint.
+    resource function get health() returns json {
+        return {"status": "UP", "service": "restaurant-service"};
     }
 
-    // Get all restaurants
-    resource function get .() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = restaurantsCol->find({});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch restaurants"}};
+    # Register a new restaurant.
+    # + payload - Restaurant details
+    # + return - Created restaurant or error
+    resource function post restaurants(@http:Payload RestaurantRequest payload) returns http:Created|http:InternalServerError {
+        do {
+            string restaurantId = uuid:createType1AsString();
+            string currentTime = time:utcToString(time:utcNow());
+
+            map<json> restaurantDoc = {
+                "_id": restaurantId,
+                "name": payload.name,
+                "address": payload.address,
+                "phone": payload.phone,
+                "cuisine": payload.cuisine,
+                "rating": 0.0,
+                "isOpen": false,
+                "createdAt": currentTime,
+                "updatedAt": currentTime
+            };
+
+            check restaurantsCollection->insertOne(restaurantDoc);
+
+            log:printInfo("Restaurant registered", restaurantId = restaurantId);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Restaurant registered successfully",
+                    "data": restaurantDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to register restaurant", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        json[] restaurants = [];
-        error? e = result.forEach(function(map<json> doc) {
-            restaurants.push(doc);
-        });
-        if e is error {
-            log:printError("Error iterating restaurants", e);
-        }
-        return restaurants;
     }
 
-    // Get restaurant by ID
-    resource function get [string id]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = restaurantsCol->findOne({"id": id});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Retrieve all restaurants.
+    # + return - List of all restaurants
+    resource function get restaurants() returns json|http:InternalServerError {
+        do {
+            map<json>[] restaurants = check queryCollection(restaurantsCollection, {});
+
+            return {
+                "status": "success",
+                "count": restaurants.length(),
+                "data": restaurants
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve restaurants", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if result is () {
-            return <http:NotFound>{body: {message: "Restaurant not found", id: id}};
-        }
-        return result;
     }
 
-    // Update restaurant
-    resource function put [string id](RestaurantRequest req) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = restaurantsCol->findOne({"id": id});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Retrieve a restaurant by ID.
+    # + restaurantId - The unique restaurant identifier
+    # + return - Restaurant details or not found
+    resource function get restaurants/[string restaurantId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": restaurantId};
+            map<json>[] results = check queryCollection(restaurantsCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Restaurant not found"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve restaurant", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Restaurant not found", id: id}};
-        }
-        map<json> updateFields = {
-            "name": req.name,
-            "address": req.address,
-            "phone": req.phone,
-            "openingHours": req.openingHours,
-            "closingHours": req.closingHours
-        };
-        mongodb:UpdateResult|mongodb:Error updateResult = restaurantsCol->updateOne({"id": id}, {"set": updateFields});
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to update restaurant"}};
-        }
-        map<json>|mongodb:Error? updated = restaurantsCol->findOne({"id": id});
-        if updated is map<json> {
-            return updated;
-        }
-        return <http:InternalServerError>{body: {message: "Failed to fetch updated restaurant"}};
     }
 
-    // Toggle restaurant open/close status
-    resource function put [string id]/status(json statusReq) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = restaurantsCol->findOne({"id": id});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Update a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + payload - Updated restaurant fields
+    # + return - Updated restaurant or error
+    resource function put restaurants/[string restaurantId](@http:Payload json payload) returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": restaurantId};
+            string currentTime = time:utcToString(time:utcNow());
+
+            map<json> payloadMap = check payload.ensureType();
+            payloadMap["updatedAt"] = currentTime;
+
+            mongodb:Update update = {set: payloadMap};
+            mongodb:UpdateResult res = check restaurantsCollection->updateOne(filter, update);
+
+            if res.matchedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Restaurant not found"}
+                };
+                return notFound;
+            }
+
+            map<json>[] results = check queryCollection(restaurantsCollection, filter);
+            return {
+                "status": "success",
+                "message": "Restaurant updated successfully",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to update restaurant", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Restaurant not found", id: id}};
-        }
-        boolean|error isOpen = statusReq.isOpen.ensureType();
-        if isOpen is error {
-            return <http:InternalServerError>{body: {message: "Invalid status"}};
-        }
-        mongodb:UpdateResult|mongodb:Error updateResult = restaurantsCol->updateOne({"id": id}, {"set": {"isOpen": isOpen}});
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to update status"}};
-        }
-        return {id: id, isOpen: isOpen};
     }
 
-    // ====== Menu Items ======
+    # Delete a restaurant and all associated data.
+    # + restaurantId - The unique restaurant identifier
+    # + return - Success or error
+    resource function delete restaurants/[string restaurantId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": restaurantId};
+            mongodb:DeleteResult res = check restaurantsCollection->deleteOne(filter);
 
-    // Add menu item
-    resource function post [string restaurantId]/menu(MenuItemRequest req) returns json|http:InternalServerError {
-        string id = uuid:createType1AsString();
-        MenuItem item = {
-            id: id,
-            restaurantId: restaurantId,
-            name: req.name,
-            description: req.description,
-            price: req.price,
-            stock: req.stock,
-            category: req.category,
-            available: req.stock > 0
-        };
-        map<json> doc = {
-            "id": item.id,
-            "restaurantId": item.restaurantId,
-            "name": item.name,
-            "description": item.description,
-            "price": item.price,
-            "stock": item.stock,
-            "category": item.category,
-            "available": item.available
-        };
-        mongodb:Error? insertResult = menuItemsCol->insertOne(doc);
-        if insertResult is mongodb:Error {
-            log:printError("Failed to insert menu item", insertResult);
-            return <http:InternalServerError>{body: {message: "Failed to add menu item"}};
+            if res.deletedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Restaurant not found"}
+                };
+                return notFound;
+            }
+
+            // Clean up related data
+            map<json> relatedFilter = {"restaurantId": restaurantId};
+            _ = check menuItemsCollection->deleteMany(relatedFilter);
+            _ = check openingHoursCollection->deleteMany(relatedFilter);
+
+            log:printInfo("Restaurant deleted", restaurantId = restaurantId);
+
+            return {
+                "status": "success",
+                "message": "Restaurant and related data deleted"
+            };
+        } on fail error e {
+            log:printError("Failed to delete restaurant", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        return item;
     }
 
-    // Get menu for a restaurant
-    resource function get [string restaurantId]/menu() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = menuItemsCol->find({"restaurantId": restaurantId});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch menu"}};
+    # Toggle restaurant open/closed status.
+    # + restaurantId - The unique restaurant identifier
+    # + return - Updated status or error
+    resource function put restaurants/[string restaurantId]/status(@http:Payload json payload) returns json|http:NotFound|http:InternalServerError {
+        do {
+            boolean isOpen = check payload.isOpen;
+            map<json> filter = {"_id": restaurantId};
+            string currentTime = time:utcToString(time:utcNow());
+
+            mongodb:Update update = {set: {"isOpen": isOpen, "updatedAt": currentTime}};
+            mongodb:UpdateResult res = check restaurantsCollection->updateOne(filter, update);
+
+            if res.matchedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Restaurant not found"}
+                };
+                return notFound;
+            }
+
+            string statusStr = isOpen ? "open" : "closed";
+            log:printInfo("Restaurant status updated", restaurantId = restaurantId, status = statusStr);
+
+            return {
+                "status": "success",
+                "message": "Restaurant is now " + statusStr
+            };
+        } on fail error e {
+            log:printError("Failed to update restaurant status", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        json[] items = [];
-        error? e = result.forEach(function(map<json> doc) {
-            items.push(doc);
-        });
-        if e is error {
-            log:printError("Error iterating menu items", e);
-        }
-        return items;
     }
 
-    // Update menu item
-    resource function put [string restaurantId]/menu/[string itemId](MenuItemRequest req) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = menuItemsCol->findOne({"id": itemId, "restaurantId": restaurantId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    // ─── Menu Item Endpoints ─────────────────
+
+    # Add a menu item to a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + payload - Menu item details
+    # + return - Created menu item or error
+    resource function post restaurants/[string restaurantId]/menu(@http:Payload MenuItemRequest payload) returns http:Created|http:NotFound|http:InternalServerError {
+        do {
+            map<json> restaurantFilter = {"_id": restaurantId};
+            map<json>[] restaurants = check queryCollection(restaurantsCollection, restaurantFilter);
+            if restaurants.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Restaurant not found"}
+                };
+                return notFound;
+            }
+
+            string menuItemId = uuid:createType1AsString();
+            map<json> menuItemDoc = {
+                "_id": menuItemId,
+                "restaurantId": restaurantId,
+                "name": payload.name,
+                "description": payload.description,
+                "price": payload.price,
+                "category": payload.category,
+                "available": true
+            };
+
+            if payload.imageUrl is string {
+                menuItemDoc["imageUrl"] = <string>payload.imageUrl;
+            }
+
+            check menuItemsCollection->insertOne(menuItemDoc);
+
+            log:printInfo("Menu item added", restaurantId = restaurantId, menuItemId = menuItemId);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Menu item added",
+                    "data": menuItemDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to add menu item", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Menu item not found"}};
-        }
-        map<json> updateFields = {
-            "name": req.name,
-            "description": req.description,
-            "price": req.price,
-            "stock": req.stock,
-            "category": req.category,
-            "available": req.stock > 0
-        };
-        mongodb:UpdateResult|mongodb:Error updateResult = menuItemsCol->updateOne({"id": itemId}, {"set": updateFields});
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to update menu item"}};
-        }
-        map<json>|mongodb:Error? updated = menuItemsCol->findOne({"id": itemId});
-        if updated is map<json> {
-            return updated;
-        }
-        return <http:InternalServerError>{body: {message: "Failed to fetch updated menu item"}};
     }
 
-    // Delete menu item
-    resource function delete [string restaurantId]/menu/[string itemId]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = menuItemsCol->findOne({"id": itemId, "restaurantId": restaurantId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Retrieve the full menu for a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + return - List of menu items
+    resource function get restaurants/[string restaurantId]/menu() returns json|http:InternalServerError {
+        do {
+            map<json> filter = {"restaurantId": restaurantId};
+            map<json>[] menuItems = check queryCollection(menuItemsCollection, filter);
+
+            return {
+                "status": "success",
+                "count": menuItems.length(),
+                "data": menuItems
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve menu", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Menu item not found"}};
-        }
-        mongodb:DeleteResult|mongodb:Error deleteResult = menuItemsCol->deleteOne({"id": itemId});
-        if deleteResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to delete menu item"}};
-        }
-        return {message: "Menu item deleted", itemId: itemId};
     }
 
-    // Decrement stock for a menu item (called when order is placed)
-    resource function put menu/[string itemId]/decrement(json body) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = menuItemsCol->findOne({"id": itemId});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
+    # Update a menu item.
+    # + restaurantId - The unique restaurant identifier
+    # + itemId - The unique menu item identifier
+    # + payload - Updated menu item fields
+    # + return - Updated menu item or error
+    resource function put restaurants/[string restaurantId]/menu/[string itemId](@http:Payload json payload) returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": itemId, "restaurantId": restaurantId};
+            map<json> payloadMap = check payload.ensureType();
+            mongodb:Update update = {set: payloadMap};
+            mongodb:UpdateResult res = check menuItemsCollection->updateOne(filter, update);
+
+            if res.matchedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Menu item not found"}
+                };
+                return notFound;
+            }
+
+            map<json>[] results = check queryCollection(menuItemsCollection, filter);
+            return {
+                "status": "success",
+                "message": "Menu item updated",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to update menu item", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Menu item not found"}};
+    }
+
+    # Delete a menu item from a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + itemId - The unique menu item identifier
+    # + return - Success or error
+    resource function delete restaurants/[string restaurantId]/menu/[string itemId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": itemId, "restaurantId": restaurantId};
+            mongodb:DeleteResult res = check menuItemsCollection->deleteOne(filter);
+
+            if res.deletedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Menu item not found"}
+                };
+                return notFound;
+            }
+
+            return {"status": "success", "message": "Menu item deleted"};
+        } on fail error e {
+            log:printError("Failed to delete menu item", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        int|error qty = body.quantity.ensureType();
-        int quantity = qty is error ? 1 : qty;
-        mongodb:UpdateResult|mongodb:Error updateResult = menuItemsCol->updateOne(
-            {"id": itemId},
-            {"inc": {"stock": -quantity}}
-        );
-        if updateResult is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to decrement stock"}};
+    }
+
+    // ─── Opening Hours Endpoints ─────────────
+
+    # Set opening hours for a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + payload - Opening hours details
+    # + return - Created hours entry or error
+    resource function post restaurants/[string restaurantId]/hours(@http:Payload OpeningHoursRequest payload) returns http:Created|http:InternalServerError {
+        do {
+            string hoursId = uuid:createType1AsString();
+            map<json> hoursDoc = {
+                "_id": hoursId,
+                "restaurantId": restaurantId,
+                "day": payload.day,
+                "openTime": payload.openTime,
+                "closeTime": payload.closeTime
+            };
+
+            check openingHoursCollection->insertOne(hoursDoc);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Opening hours set",
+                    "data": hoursDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to set opening hours", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
         }
-        return {message: "Stock decremented", itemId: itemId, decrementedBy: quantity};
+    }
+
+    # Retrieve opening hours for a restaurant.
+    # + restaurantId - The unique restaurant identifier
+    # + return - Opening hours data
+    resource function get restaurants/[string restaurantId]/hours() returns json|http:InternalServerError {
+        do {
+            map<json> filter = {"restaurantId": restaurantId};
+            map<json>[] hours = check queryCollection(openingHoursCollection, filter);
+
+            return {
+                "status": "success",
+                "data": hours
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve opening hours", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
     }
 }

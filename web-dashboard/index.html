@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FoodPulse — SME Food Delivery Platform Dashboard</title>
+  <meta name="description" content="Distributed food delivery platform dashboard for Namibian SME restaurants, powered by Ballerina microservices and Apache Kafka.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+
+    <!-- ========== SIDEBAR ========== -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-logo">⚡</div>
+        <div>
+          <div class="brand-name">FoodPulse</div>
+          <div class="brand-tag">SME Delivery Platform</div>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <a class="nav-link active" data-view="dashboard" id="nav-dashboard">
+          <span class="nav-icon">📊</span>
+          <span>Dashboard</span>
+        </a>
+        <a class="nav-link" data-view="customers" id="nav-customers">
+          <span class="nav-icon">👤</span>
+          <span>Customers</span>
+        </a>
+        <a class="nav-link" data-view="restaurants" id="nav-restaurants">
+          <span class="nav-icon">🍳</span>
+          <span>Restaurants</span>
+        </a>
+        <a class="nav-link" data-view="orders" id="nav-orders">
+          <span class="nav-icon">📦</span>
+          <span>Orders</span>
+          <span class="nav-badge" id="orders-badge">0</span>
+        </a>
+        <a class="nav-link" data-view="payments" id="nav-payments">
+          <span class="nav-icon">💳</span>
+          <span>Payments</span>
+        </a>
+        <a class="nav-link" data-view="kitchen" id="nav-kitchen">
+          <span class="nav-icon">🔥</span>
+          <span>Kitchen (KDS)</span>
+          <span class="nav-badge" id="kitchen-badge">0</span>
+        </a>
+        <a class="nav-link" data-view="deliveries" id="nav-deliveries">
+          <span class="nav-icon">🛵</span>
+          <span>Deliveries</span>
+        </a>
+        <a class="nav-link" data-view="notifications" id="nav-notifications">
+          <span class="nav-icon">🔔</span>
+          <span>Notifications</span>
+          <span class="nav-badge" id="notif-badge">0</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="system-chip">
+          <span class="chip-dot"></span>
+          <span>7 Microservices</span>
+        </div>
+        <div class="system-chip">
+          <span class="chip-dot"></span>
+          <span>Kafka: kafka:9092</span>
+        </div>
+        <div class="system-chip">
+          <span class="chip-dot"></span>
+          <span>MongoDB: food_delivery</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ========== MAIN CONTENT ========== -->
+    <main class="main">
+
+      <!-- ===== VIEW: DASHBOARD ===== -->
+      <section class="view active" id="view-dashboard">
+        <div class="view-head">
+          <h1 class="view-title">Platform Overview</h1>
+          <p class="view-sub">Ministry of Industrialisation & Trade — SME Food Delivery Initiative</p>
+        </div>
+
+        <div class="kpi-row">
+          <div class="kpi-card">
+            <div class="kpi-icon bg-indigo">📦</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="kpi-orders">0</div>
+              <div class="kpi-label">Total Orders</div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon bg-emerald">💰</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="kpi-revenue">N$ 0.00</div>
+              <div class="kpi-label">Gross Revenue (GMV)</div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon bg-cyan">📈</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="kpi-commission">N$ 0.00</div>
+              <div class="kpi-label">Platform Commission (10%)</div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon bg-amber">👤</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="kpi-customers">0</div>
+              <div class="kpi-label">Registered Customers</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="row-2col">
+          <!-- Recent Orders -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title">Recent Orders</h2>
+            </div>
+            <div class="panel-body">
+              <table class="tbl">
+                <thead><tr><th>Order</th><th>Customer</th><th>Amount</th><th>Status</th></tr></thead>
+                <tbody id="dash-recent-orders"></tbody>
+              </table>
+            </div>
+          </div>
+          <!-- Kafka Event Log -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title">Kafka Event Log</h2>
+              <button class="btn btn-xs btn-ghost" id="btn-clear-events">Clear</button>
+            </div>
+            <div class="panel-body event-log-scroll" id="event-log"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: CUSTOMERS ===== -->
+      <section class="view" id="view-customers">
+        <div class="view-head">
+          <h1 class="view-title">Customer Service</h1>
+          <p class="view-sub">Register and manage customer profiles. Endpoint: POST /api/v1/customers</p>
+        </div>
+
+        <div class="row-2col">
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">Register New Customer</h2></div>
+            <div class="panel-body">
+              <form id="form-add-customer" class="form-stack">
+                <div class="field">
+                  <label>Full Name</label>
+                  <input type="text" id="c-name" placeholder="e.g. Helena Shikongo" required>
+                </div>
+                <div class="field">
+                  <label>Email Address</label>
+                  <input type="email" id="c-email" placeholder="e.g. helena@example.na" required>
+                </div>
+                <div class="field">
+                  <label>Phone Number</label>
+                  <input type="tel" id="c-phone" placeholder="e.g. +264 81 245 8899" required>
+                </div>
+                <div class="field">
+                  <label>Delivery Address</label>
+                  <input type="text" id="c-address" placeholder="e.g. 44 Independence Ave, Windhoek">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Register Customer</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">Registered Customers</h2></div>
+            <div class="panel-body">
+              <table class="tbl">
+                <thead><tr><th>ID</th><th>Name</th><th>Phone</th><th>Email</th><th>Action</th></tr></thead>
+                <tbody id="tbl-customers"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: RESTAURANTS ===== -->
+      <section class="view" id="view-restaurants">
+        <div class="view-head">
+          <h1 class="view-title">Restaurant Service</h1>
+          <p class="view-sub">Browse SME restaurants and their digital menus. Endpoint: GET /api/v1/restaurants</p>
+        </div>
+        <div class="restaurants-grid" id="restaurants-grid"></div>
+      </section>
+
+      <!-- ===== VIEW: ORDERS ===== -->
+      <section class="view" id="view-orders">
+        <div class="view-head">
+          <h1 class="view-title">Order Service</h1>
+          <p class="view-sub">Place orders, view lifecycle, and track status transitions via Kafka events.</p>
+        </div>
+
+        <div class="row-2col">
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">Place New Order</h2></div>
+            <div class="panel-body">
+              <form id="form-place-order" class="form-stack">
+                <div class="field">
+                  <label>Select Customer</label>
+                  <select id="o-customer" required></select>
+                </div>
+                <div class="field">
+                  <label>Select Restaurant</label>
+                  <select id="o-restaurant" required></select>
+                </div>
+                <div class="field">
+                  <label>Menu Items</label>
+                  <div id="o-menu-items" class="menu-checklist"></div>
+                </div>
+                <div class="field">
+                  <label>Delivery Address</label>
+                  <input type="text" id="o-address" placeholder="Delivery address">
+                </div>
+                <div class="order-total-bar">
+                  <span>Order Total:</span>
+                  <span class="total-amount" id="o-total">N$ 0.00</span>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Place Order → Kafka (orders.created)</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">All Orders</h2></div>
+            <div class="panel-body">
+              <table class="tbl">
+                <thead><tr><th>Order ID</th><th>Customer</th><th>Restaurant</th><th>Amount</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody id="tbl-orders"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: PAYMENTS ===== -->
+      <section class="view" id="view-payments">
+        <div class="view-head">
+          <h1 class="view-title">Payment Service</h1>
+          <p class="view-sub">Simulates payment processing (90% success rate). Consumes orders.created → emits payments.completed / payments.failed.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Pending Payments</h2>
+            <p class="text-muted">Orders with status CREATED awaiting payment verification.</p>
+          </div>
+          <div class="panel-body">
+            <table class="tbl">
+              <thead><tr><th>Order ID</th><th>Customer</th><th>Amount</th><th>Method</th><th>Action</th></tr></thead>
+              <tbody id="tbl-pending-payments"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:24px;">
+          <div class="panel-head"><h2 class="panel-title">Payment History</h2></div>
+          <div class="panel-body">
+            <table class="tbl">
+              <thead><tr><th>Payment ID</th><th>Order ID</th><th>Amount</th><th>Method</th><th>Status</th><th>Time</th></tr></thead>
+              <tbody id="tbl-payment-history"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: KITCHEN (KDS) ===== -->
+      <section class="view" id="view-kitchen">
+        <div class="view-head">
+          <h1 class="view-title">Kitchen Display System (KDS)</h1>
+          <p class="view-sub">Restaurant staff view. Advance orders: CONFIRMED → PREPARING → READY. Publishes Kafka events at each transition.</p>
+        </div>
+
+        <div class="kds-board">
+          <div class="kds-col">
+            <div class="kds-col-head bg-amber-faded">
+              <span class="kds-col-dot dot-amber"></span>
+              <span>Confirmed</span>
+              <span class="kds-col-count" id="kds-count-confirmed">0</span>
+            </div>
+            <div class="kds-col-body" id="kds-confirmed"></div>
+          </div>
+          <div class="kds-col">
+            <div class="kds-col-head bg-cyan-faded">
+              <span class="kds-col-dot dot-cyan"></span>
+              <span>Preparing</span>
+              <span class="kds-col-count" id="kds-count-preparing">0</span>
+            </div>
+            <div class="kds-col-body" id="kds-preparing"></div>
+          </div>
+          <div class="kds-col">
+            <div class="kds-col-head bg-emerald-faded">
+              <span class="kds-col-dot dot-emerald"></span>
+              <span>Ready for Pickup</span>
+              <span class="kds-col-count" id="kds-count-ready">0</span>
+            </div>
+            <div class="kds-col-body" id="kds-ready"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: DELIVERIES ===== -->
+      <section class="view" id="view-deliveries">
+        <div class="view-head">
+          <h1 class="view-title">Delivery Service</h1>
+          <p class="view-sub">Assign drivers to ready orders, simulate GPS movement, and complete deliveries. Emits delivery.assigned / delivery.completed.</p>
+        </div>
+
+        <div class="kpi-row" style="margin-bottom:24px;">
+          <div class="kpi-card">
+            <div class="kpi-icon bg-emerald">🛵</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="del-avail">0</div>
+              <div class="kpi-label">Available Drivers</div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon bg-indigo">🚚</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="del-busy">0</div>
+              <div class="kpi-label">Active Deliveries</div>
+            </div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-icon bg-cyan">📍</div>
+            <div class="kpi-body">
+              <div class="kpi-val" id="del-completed">0</div>
+              <div class="kpi-label">Completed Today</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="row-2col">
+          <!-- Orders ready for dispatch -->
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">Orders Ready for Dispatch</h2></div>
+            <div class="panel-body">
+              <table class="tbl">
+                <thead><tr><th>Order</th><th>Restaurant</th><th>Customer Address</th><th>Action</th></tr></thead>
+                <tbody id="tbl-ready-dispatch"></tbody>
+              </table>
+            </div>
+          </div>
+          <!-- Active deliveries -->
+          <div class="panel">
+            <div class="panel-head"><h2 class="panel-title">Active & Completed Deliveries</h2></div>
+            <div class="panel-body">
+              <table class="tbl">
+                <thead><tr><th>Delivery</th><th>Driver</th><th>Order</th><th>Status</th><th>Action</th></tr></thead>
+                <tbody id="tbl-deliveries"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Driver Fleet -->
+        <div class="panel" style="margin-top:24px;">
+          <div class="panel-head"><h2 class="panel-title">Driver Fleet</h2></div>
+          <div class="panel-body">
+            <table class="tbl">
+              <thead><tr><th>ID</th><th>Name</th><th>Vehicle</th><th>Status</th><th>Rating</th><th>Trips</th><th>GPS</th></tr></thead>
+              <tbody id="tbl-drivers"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== VIEW: NOTIFICATIONS ===== -->
+      <section class="view" id="view-notifications">
+        <div class="view-head">
+          <h1 class="view-title">Notification Service</h1>
+          <p class="view-sub">Multi-channel notification log (SMS, Email, Push). Consumes all Kafka topics and dispatches alerts.</p>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Notification History</h2>
+            <button class="btn btn-xs btn-ghost" id="btn-clear-notifs">Clear All</button>
+          </div>
+          <div class="panel-body">
+            <table class="tbl">
+              <thead><tr><th>Time</th><th>Channel</th><th>Recipient</th><th>Message</th></tr></thead>
+              <tbody id="tbl-notifications"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Toast container -->
+  <div class="toast-rack" id="toast-rack"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

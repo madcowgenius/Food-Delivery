@@ -1,252 +1,385 @@
 import ballerina/http;
-import ballerina/uuid;
 import ballerina/log;
+import ballerina/uuid;
 import ballerina/time;
-import ballerinax/kafka;
 import ballerinax/mongodb;
 
-// MongoDB configuration
-configurable string mongoHost = "mongo";
+// ──────────────────────────────────────────────
+// Configurable Variables
+// ──────────────────────────────────────────────
+configurable int servicePort = 8081;
+configurable string mongoHost = "localhost";
 configurable int mongoPort = 27017;
-configurable string kafkaBootstrap = "kafka:19092";
+configurable string databaseName = "customer_db";
 
-final mongodb:Client mongoClient = check new ({
-    connection: {
-        serverAddress: {
-            host: mongoHost,
-            port: mongoPort
-        }
-    }
-});
+// ──────────────────────────────────────────────
+// Record Types
+// ──────────────────────────────────────────────
 
-final mongodb:Database db = check mongoClient->getDatabase("food_delivery");
-final mongodb:Collection customersCol = check db->getCollection("customers");
-
-// Record types
+# Represents a customer in the system.
 type Customer record {|
-    string id;
+    string _id;
     string name;
     string email;
     string phone;
-    string[] addresses;
-    string[] orderHistory;
     string createdAt;
+    string updatedAt;
 |};
 
+# Request payload for creating a new customer.
 type CustomerRequest record {|
     string name;
     string email;
     string phone;
-    string[] addresses = [];
 |};
 
-type CustomerUpdate record {|
+# Request payload for updating a customer.
+type CustomerUpdateRequest record {|
     string name?;
     string email?;
     string phone?;
-    string[] addresses?;
 |};
 
-service /customers on new http:Listener(8082) {
+# Represents a delivery address for a customer.
+type Address record {|
+    string _id;
+    string customerId;
+    string label;
+    string street;
+    string city;
+    string state;
+    string zipCode;
+    float latitude?;
+    float longitude?;
+|};
 
-    // Create a new customer
-    resource function post .(CustomerRequest req) returns json|http:InternalServerError {
-        string id = uuid:createType1AsString();
-        Customer customer = {
-            id: id,
-            name: req.name,
-            email: req.email,
-            phone: req.phone,
-            addresses: req.addresses,
-            orderHistory: [],
-            createdAt: getCurrentTimestamp()
-        };
-        map<json> doc = customerToDoc(customer);
-        mongodb:Error? insertResult = customersCol->insertOne(doc);
-        if insertResult is mongodb:Error {
-            log:printError("Failed to insert customer", insertResult);
-            return <http:InternalServerError>{body: {message: "Failed to create customer"}};
-        }
-        log:printInfo("Customer created: " + id);
-        return customer;
-    }
+# Request payload for adding a new address.
+type AddressRequest record {|
+    string label;
+    string street;
+    string city;
+    string state;
+    string zipCode;
+    float latitude?;
+    float longitude?;
+|};
 
-    // Get all customers
-    resource function get .() returns json|http:InternalServerError {
-        stream<map<json>, error?>|mongodb:Error result = customersCol->find({});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Failed to fetch customers"}};
-        }
-        json[] customers = [];
-        error? e = result.forEach(function(map<json> doc) {
-            customers.push(docToCustomerJson(doc));
-        });
-        if e is error {
-            log:printError("Error iterating customers", e);
-        }
-        return customers;
-    }
+// ──────────────────────────────────────────────
+// MongoDB Client Initialization
+// ──────────────────────────────────────────────
+final mongodb:Client mongoClient;
+final mongodb:Database db;
 
-    // Get customer by ID
-    resource function get [string id]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = customersCol->findOne({"id": id});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if result is () {
-            return <http:NotFound>{body: {message: "Customer not found", id: id}};
-        }
-        return docToCustomerJson(result);
-    }
+const string CUSTOMERS_COLLECTION = "customers";
+const string ADDRESSES_COLLECTION = "addresses";
 
-    // Update customer
-    resource function put [string id](CustomerUpdate req) returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = customersCol->findOne({"id": id});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Customer not found", id: id}};
-        }
-        map<json> updateFields = {};
-        if req.name is string {
-            updateFields["name"] = req.name;
-        }
-        if req.email is string {
-            updateFields["email"] = req.email;
-        }
-        if req.phone is string {
-            updateFields["phone"] = req.phone;
-        }
-        if req.addresses is string[] {
-            updateFields["addresses"] = req.addresses.toJson();
-        }
-        mongodb:UpdateResult|mongodb:Error updateResult = customersCol->updateOne({"id": id}, {"set": updateFields});
-        if updateResult is mongodb:Error {
-            log:printError("Failed to update customer", updateResult);
-            return <http:InternalServerError>{body: {message: "Failed to update customer"}};
-        }
-        map<json>|mongodb:Error? updated = customersCol->findOne({"id": id});
-        if updated is map<json> {
-            return docToCustomerJson(updated);
-        }
-        return <http:InternalServerError>{body: {message: "Failed to fetch updated customer"}};
-    }
+final mongodb:Collection customersCollection;
+final mongodb:Collection addressesCollection;
 
-    // Delete customer
-    resource function delete [string id]() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? existing = customersCol->findOne({"id": id});
-        if existing is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if existing is () {
-            return <http:NotFound>{body: {message: "Customer not found", id: id}};
-        }
-        mongodb:DeleteResult|mongodb:Error deleteResult = customersCol->deleteOne({"id": id});
-        if deleteResult is mongodb:Error {
-            log:printError("Failed to delete customer", deleteResult);
-            return <http:InternalServerError>{body: {message: "Failed to delete customer"}};
-        }
-        return {message: "Customer deleted", id: id};
-    }
-
-    // Add order to history (also called by Kafka consumer)
-    resource function post [string id]/orders(json orderRef) returns json|http:NotFound|http:InternalServerError {
-        return addOrderToHistory(id, orderRef);
-    }
-
-    // Get customer order history
-    resource function get [string id]/orders() returns json|http:NotFound|http:InternalServerError {
-        map<json>|mongodb:Error? result = customersCol->findOne({"id": id});
-        if result is mongodb:Error {
-            return <http:InternalServerError>{body: {message: "Database error"}};
-        }
-        if result is () {
-            return <http:NotFound>{body: {message: "Customer not found", id: id}};
-        }
-        return {customerId: id, orderHistory: result["orderHistory"]};
-    }
-}
-
-// Shared helper used by both the HTTP resource and the Kafka consumer
-function addOrderToHistory(string customerId, json orderRef)
-        returns json|http:NotFound|http:InternalServerError {
-    map<json>|mongodb:Error? existing = customersCol->findOne({"id": customerId});
-    if existing is mongodb:Error {
-        return <http:InternalServerError>{body: {message: "Database error"}};
-    }
-    if existing is () {
-        return <http:NotFound>{body: {message: "Customer not found", id: customerId}};
-    }
-    string|error orderId = orderRef.orderId.ensureType();
-    if orderId is error {
-        return <http:InternalServerError>{body: {message: "Invalid order reference"}};
-    }
-    mongodb:UpdateResult|mongodb:Error updateResult = customersCol->updateOne(
-        {"id": customerId},
-        {"push": {"orderHistory": orderId}}
-    );
-    if updateResult is mongodb:Error {
-        return <http:InternalServerError>{body: {message: "Failed to update order history"}};
-    }
-    return {message: "Order added to history", customerId: customerId, orderId: orderId};
-}
-
-// Kafka Consumer: auto-append new orders to the customer's history
-listener kafka:Listener customerEventsListener = new (kafkaBootstrap, {
-    groupId: "customer-service-group",
-    topics: ["orders.created"]
-});
-
-service on customerEventsListener {
-    remote function onConsumerRecord(kafka:BytesConsumerRecord[] records) returns error? {
-        foreach var record in records {
-            string value = check string:fromBytes(record.value);
-            json payload = check value.fromJsonString();
-            string eventType = check payload.eventType.ensureType();
-            if eventType == "ORDER_CREATED" {
-                string orderId = check payload.orderId.ensureType();
-                string customerId = check payload.customerId.ensureType();
-                // Best-effort append; log if it fails
-                json|http:NotFound|http:InternalServerError result =
-                    addOrderToHistory(customerId, {orderId: orderId});
-                if result is http:NotFound {
-                    log:printWarn("Order history skipped: customer " + customerId + " not found");
-                } else if result is http:InternalServerError {
-                    log:printError("Order history update failed for customer " + customerId);
-                } else {
-                    log:printInfo("Order " + orderId + " appended to customer " + customerId);
-                }
+function init() returns error? {
+    mongoClient = check new ({
+        connection: {
+            serverAddress: {
+                host: mongoHost,
+                port: mongoPort
             }
         }
+    });
+    db = check mongoClient->getDatabase(databaseName);
+    customersCollection = check db->getCollection(CUSTOMERS_COLLECTION);
+    addressesCollection = check db->getCollection(ADDRESSES_COLLECTION);
+}
+
+// Helper function to query a collection and return array of map<json>
+isolated function queryCollection(mongodb:Collection collectionRef, map<json> filter = {}) returns map<json>[]|error {
+    stream<map<json>, error?> docStream = check collectionRef->find(filter);
+    map<json>[] results = check from var doc in docStream select doc;
+    check docStream.close();
+    return results;
+}
+
+// ──────────────────────────────────────────────
+// HTTP REST API Service
+// ──────────────────────────────────────────────
+service /api/v1 on new http:Listener(servicePort) {
+
+    # Health check endpoint.
+    resource function get health() returns json {
+        return {"status": "UP", "service": "customer-service"};
     }
-}
 
-function customerToDoc(Customer c) returns map<json> {
-    return {
-        "id": c.id,
-        "name": c.name,
-        "email": c.email,
-        "phone": c.phone,
-        "addresses": c.addresses.toJson(),
-        "orderHistory": c.orderHistory.toJson(),
-        "createdAt": c.createdAt
-    };
-}
+    # Register a new customer.
+    # + payload - Customer registration details
+    # + return - Created customer or error
+    resource function post customers(@http:Payload CustomerRequest payload) returns http:Created|http:BadRequest|http:InternalServerError {
+        do {
+            string customerId = uuid:createType1AsString();
+            string currentTime = time:utcToString(time:utcNow());
 
-function docToCustomerJson(map<json> doc) returns json {
-    return {
-        id: doc["id"],
-        name: doc["name"],
-        email: doc["email"],
-        phone: doc["phone"],
-        addresses: doc["addresses"],
-        orderHistory: doc["orderHistory"],
-        createdAt: doc["createdAt"]
-    };
-}
+            map<json> customerDoc = {
+                "_id": customerId,
+                "name": payload.name,
+                "email": payload.email,
+                "phone": payload.phone,
+                "createdAt": currentTime,
+                "updatedAt": currentTime
+            };
 
-// FIXED: was hardcoded to "2026-10-05T00:00:00Z"
-function getCurrentTimestamp() returns string {
-    return time:utcToString(time:utcNow());
+            check customersCollection->insertOne(customerDoc);
+
+            log:printInfo("Customer registered successfully", customerId = customerId);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Customer registered successfully",
+                    "data": customerDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to register customer", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Retrieve all customers.
+    # + return - List of all customers
+    resource function get customers() returns json|http:InternalServerError {
+        do {
+            map<json>[] customers = check queryCollection(customersCollection, {});
+
+            return {
+                "status": "success",
+                "count": customers.length(),
+                "data": customers
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve customers", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Retrieve a customer by ID.
+    # + customerId - The unique customer identifier
+    # + return - Customer details or not found
+    resource function get customers/[string customerId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": customerId};
+            map<json>[] results = check queryCollection(customersCollection, filter);
+
+            if results.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Customer not found"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve customer", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Update an existing customer.
+    # + customerId - The unique customer identifier
+    # + payload - Fields to update
+    # + return - Updated customer or error
+    resource function put customers/[string customerId](@http:Payload CustomerUpdateRequest payload) returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": customerId};
+            string currentTime = time:utcToString(time:utcNow());
+
+            map<json> updateFields = {"updatedAt": currentTime};
+            if payload.name is string {
+                updateFields["name"] = <string>payload.name;
+            }
+            if payload.email is string {
+                updateFields["email"] = <string>payload.email;
+            }
+            if payload.phone is string {
+                updateFields["phone"] = <string>payload.phone;
+            }
+
+            mongodb:Update update = {set: updateFields};
+            mongodb:UpdateResult res = check customersCollection->updateOne(filter, update);
+
+            if res.matchedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Customer not found"}
+                };
+                return notFound;
+            }
+
+            log:printInfo("Customer updated successfully", customerId = customerId);
+
+            // Fetch and return updated document
+            map<json>[] results = check queryCollection(customersCollection, filter);
+            return {
+                "status": "success",
+                "message": "Customer updated successfully",
+                "data": results[0]
+            };
+        } on fail error e {
+            log:printError("Failed to update customer", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Delete a customer.
+    # + customerId - The unique customer identifier
+    # + return - Success or error
+    resource function delete customers/[string customerId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": customerId};
+            mongodb:DeleteResult res = check customersCollection->deleteOne(filter);
+
+            if res.deletedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Customer not found"}
+                };
+                return notFound;
+            }
+
+            // Also delete associated addresses
+            map<json> addressFilter = {"customerId": customerId};
+            _ = check addressesCollection->deleteMany(addressFilter);
+
+            log:printInfo("Customer deleted successfully", customerId = customerId);
+
+            return {
+                "status": "success",
+                "message": "Customer and associated addresses deleted"
+            };
+        } on fail error e {
+            log:printError("Failed to delete customer", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Add a delivery address for a customer.
+    # + customerId - The unique customer identifier
+    # + payload - Address details
+    # + return - Created address or error
+    resource function post customers/[string customerId]/addresses(@http:Payload AddressRequest payload) returns http:Created|http:NotFound|http:InternalServerError {
+        do {
+            // Verify customer exists
+            map<json> customerFilter = {"_id": customerId};
+            map<json>[] customers = check queryCollection(customersCollection, customerFilter);
+            if customers.length() == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Customer not found"}
+                };
+                return notFound;
+            }
+
+            string addressId = uuid:createType1AsString();
+            map<json> addressDoc = {
+                "_id": addressId,
+                "customerId": customerId,
+                "label": payload.label,
+                "street": payload.street,
+                "city": payload.city,
+                "state": payload.state,
+                "zipCode": payload.zipCode
+            };
+
+            // Add optional coordinates if provided
+            if payload.latitude is float {
+                addressDoc["latitude"] = <float>payload.latitude;
+            }
+            if payload.longitude is float {
+                addressDoc["longitude"] = <float>payload.longitude;
+            }
+
+            check addressesCollection->insertOne(addressDoc);
+
+            log:printInfo("Address added for customer", customerId = customerId, addressId = addressId);
+
+            http:Created response = {
+                body: {
+                    "status": "success",
+                    "message": "Address added successfully",
+                    "data": addressDoc
+                }
+            };
+            return response;
+        } on fail error e {
+            log:printError("Failed to add address", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Retrieve all addresses for a customer.
+    # + customerId - The unique customer identifier
+    # + return - List of addresses
+    resource function get customers/[string customerId]/addresses() returns json|http:InternalServerError {
+        do {
+            map<json> filter = {"customerId": customerId};
+            map<json>[] addresses = check queryCollection(addressesCollection, filter);
+
+            return {
+                "status": "success",
+                "count": addresses.length(),
+                "data": addresses
+            };
+        } on fail error e {
+            log:printError("Failed to retrieve addresses", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
+
+    # Delete an address for a customer.
+    # + customerId - The unique customer identifier
+    # + addressId - The unique address identifier
+    # + return - Success or error
+    resource function delete customers/[string customerId]/addresses/[string addressId]() returns json|http:NotFound|http:InternalServerError {
+        do {
+            map<json> filter = {"_id": addressId, "customerId": customerId};
+            mongodb:DeleteResult res = check addressesCollection->deleteOne(filter);
+
+            if res.deletedCount == 0 {
+                http:NotFound notFound = {
+                    body: {"status": "error", "message": "Address not found"}
+                };
+                return notFound;
+            }
+
+            return {
+                "status": "success",
+                "message": "Address deleted successfully"
+            };
+        } on fail error e {
+            log:printError("Failed to delete address", 'error = e);
+            http:InternalServerError errorResponse = {
+                body: {"status": "error", "message": e.message()}
+            };
+            return errorResponse;
+        }
+    }
 }

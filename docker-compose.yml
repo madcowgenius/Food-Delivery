@@ -1,58 +1,103 @@
 services:
-  # ==================== Infrastructure ====================
+  # ============================================
+  # Infrastructure Services
+  # ============================================
 
-  kafka:
-    image: apache/kafka:3.9.0
-    container_name: kafka
-    ports:
-      - "9092:9092"
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,INTERNAL://:19092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - food-delivery-network
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 5
 
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: kafka-ui
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_started
     ports:
-      - "8080:8080"
+      - "9092:9092"
+      - "29092:29092"
     environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+    networks:
+      - food-delivery-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
     depends_on:
       kafka:
-        condition: service_healthy
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka to be ready...'
+      sleep 15
 
-  mongo:
-    image: mongo:7
-    container_name: mongo
+      echo 'Creating Kafka topics...'
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic orders.created --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic orders.confirmed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic orders.preparing --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic orders.ready --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic orders.cancelled --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic payments.completed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic payments.failed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic delivery.assigned --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic delivery.picked_up --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic delivery.completed --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic notifications.send --partitions 3 --replication-factor 1
+
+      echo 'Topics created successfully!'
+      kafka-topics --bootstrap-server kafka:9092 --list
+      "
+    networks:
+      - food-delivery-network
+
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
     ports:
       - "27017:27017"
     volumes:
-      - mongo-data:/data/db
+      - mongodb_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: food_delivery
+    networks:
+      - food-delivery-network
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
 
-  # ==================== Application Services ====================
+  # ============================================
+  # Application Microservices
+  # ============================================
 
   customer-service:
     build:
@@ -60,14 +105,12 @@ services:
       dockerfile: Dockerfile
     container_name: customer-service
     ports:
-      - "8082:8082"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
+      - "8081:8081"
     depends_on:
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   restaurant-service:
@@ -76,14 +119,12 @@ services:
       dockerfile: Dockerfile
     container_name: restaurant-service
     ports:
-      - "8083:8083"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
+      - "8082:8082"
     depends_on:
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   order-service:
@@ -92,17 +133,12 @@ services:
       dockerfile: Dockerfile
     container_name: order-service
     ports:
-      - "8081:8081"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
-      kafkaBootstrap: "kafka:19092"
+      - "8083:8083"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   payment-service:
@@ -112,16 +148,11 @@ services:
     container_name: payment-service
     ports:
       - "8084:8084"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
-      kafkaBootstrap: "kafka:19092"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   delivery-service:
@@ -131,16 +162,11 @@ services:
     container_name: delivery-service
     ports:
       - "8085:8085"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
-      kafkaBootstrap: "kafka:19092"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   notification-service:
@@ -150,16 +176,11 @@ services:
     container_name: notification-service
     ports:
       - "8086:8086"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
-      kafkaBootstrap: "kafka:19092"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+    networks:
+      - food-delivery-network
     restart: on-failure
 
   admin-service:
@@ -169,17 +190,73 @@ services:
     container_name: admin-service
     ports:
       - "8087:8087"
-    environment:
-      BAL_CONFIG_FILES: ""
-      mongoHost: "mongo"
-      mongoPort: "27017"
-      kafkaBootstrap: "kafka:19092"
     depends_on:
-      kafka:
-        condition: service_healthy
-      mongo:
-        condition: service_healthy
+      - kafka
+      - mongodb
+      - customer-service
+      - restaurant-service
+      - order-service
+      - payment-service
+      - delivery-service
+    networks:
+      - food-delivery-network
     restart: on-failure
 
+  # ============================================
+  # Bonus: Web Dashboard (UI & Map Simulation)
+  # ============================================
+  web-dashboard:
+    build:
+      context: ./web-dashboard
+      dockerfile: Dockerfile
+    container_name: web-dashboard
+    ports:
+      - "8080:80"
+    depends_on:
+      - admin-service
+      - order-service
+      - restaurant-service
+      - delivery-service
+    networks:
+      - food-delivery-network
+    restart: on-failure
+
+  # ============================================
+  # Bonus: Observability (Prometheus & Grafana)
+  # ============================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - food-delivery-network
+    restart: on-failure
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - food-delivery-network
+    restart: on-failure
+
+# ============================================
+# Volumes & Networks
+# ============================================
 volumes:
-  mongo-data:
+  mongodb_data:
+    driver: local
+
+networks:
+  food-delivery-network:
+    driver: bridge
+

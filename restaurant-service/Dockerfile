@@ -1,11 +1,10 @@
-FROM ballerina/ballerina:2201.13.5 AS build
-WORKDIR /app
-COPY Ballerina.toml .
-COPY main.bal .
-RUN bal build
+FROM eclipse-temurin:21-jre
 
-FROM ballerina/ballerina-runtime:2201.13.5
 WORKDIR /app
-COPY --from=build /app/target/bin/*.jar .
-EXPOSE 8083
-CMD ["java", "-jar", "restaurant_service.jar"]
+
+COPY target/bin/restaurant_service.jar ./service.jar
+COPY Config.toml .
+
+EXPOSE 8082
+
+CMD ["java", "-jar", "service.jar"]
