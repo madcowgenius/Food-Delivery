@@ -289,6 +289,7 @@ service /orders on new http:Listener(8081) {
 }
 
 // Kafka Consumer: Listen for payment and delivery events to auto-update order status
+// All transitions are validated against the state machine before persisting.
 listener kafka:Listener orderEventsListener = new (kafkaBootstrap, {
     groupId: "order-service-group",
     topics: ["payments.completed", "delivery.assigned", "delivery.completed"]
@@ -303,9 +304,35 @@ service on orderEventsListener {
             string orderId = check payload.orderId.ensureType();
             string now = time:utcToString(time:utcNow());
 
+            // Fetch current order state
+            map<json>|mongodb:Error? existingOrder = ordersCol->findOne({"id": orderId});
+            if existingOrder is mongodb:Error {
+                log:printError("Failed to fetch order " + orderId, existingOrder);
+                continue;
+            }
+            if existingOrder is () {
+                log:printWarn("Received event for unknown order: " + orderId);
+                continue;
+            }
+
+            string|error curStatusStr = existingOrder["status"].ensureType();
+            if curStatusStr is error {
+                log:printError("Order " + orderId + " has invalid status field");
+                continue;
+            }
+            OrderStatus|error currentStatus = curStatusStr.ensureType();
+            if currentStatus is error {
+                log:printError("Order " + orderId + " has unknown status: " + curStatusStr);
+                continue;
+            }
+
             match eventType {
                 "PAYMENT_COMPLETED" => {
-                    // Move order from CREATED -> CONFIRMED
+                    // Move order CREATED -> CONFIRMED (validated)
+                    if !isValidTransition(currentStatus, "CONFIRMED") {
+                        log:printWarn("Rejected transition " + currentStatus + " -> CONFIRMED for order " + orderId);
+                        continue;
+                    }
                     string|error paymentId = payload.paymentId.ensureType();
                     map<json> updateFields = {"status": "CONFIRMED", "updatedAt": now};
                     if paymentId is string {
@@ -322,7 +349,11 @@ service on orderEventsListener {
                     }
                 }
                 "DELIVERY_ASSIGNED" => {
-                    // Update order with delivery info -> OUT_FOR_DELIVERY
+                    // Move order READY -> OUT_FOR_DELIVERY (validated)
+                    if !isValidTransition(currentStatus, "OUT_FOR_DELIVERY") {
+                        log:printWarn("Rejected transition " + currentStatus + " -> OUT_FOR_DELIVERY for order " + orderId);
+                        continue;
+                    }
                     string|error deliveryId = payload.deliveryId.ensureType();
                     string|error driverId = payload.driverId.ensureType();
                     map<json> updateFields = {"status": "OUT_FOR_DELIVERY", "updatedAt": now};
@@ -343,7 +374,11 @@ service on orderEventsListener {
                     }
                 }
                 "DELIVERY_COMPLETED" => {
-                    // Mark order as DELIVERED
+                    // Move order OUT_FOR_DELIVERY -> DELIVERED (validated)
+                    if !isValidTransition(currentStatus, "DELIVERED") {
+                        log:printWarn("Rejected transition " + currentStatus + " -> DELIVERED for order " + orderId);
+                        continue;
+                    }
                     mongodb:UpdateResult|mongodb:Error updateResult = ordersCol->updateOne(
                         {"id": orderId},
                         {"set": {"status": "DELIVERED", "updatedAt": now}}
